@@ -17,7 +17,7 @@
  */
 
 #include <errno.h>
-#include <chef/containerv/disk/lcow.h>
+#include <chef/containerv/disk/windows.h>
 #include <chef/platform.h>
 #include <jansson.h>
 #include <stdio.h>
@@ -616,7 +616,7 @@ static int __normalize_bundle(
         goto cleanup;
     }
 
-    if (containerv_disk_lcow_validate_uvm(output_dir) != 0) {
+    if (containerv_disk_validate_lcow_uvm(output_dir) != 0) {
         fprintf(stderr, "mkuvm: normalized bundle is invalid at %s\n", output_dir);
         goto cleanup;
     }
