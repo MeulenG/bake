@@ -37,6 +37,7 @@ DEFAULT_CASES=(
     dummy-store-roundtrip
     order-fetch-from-store
     served-install-from-store
+    mkcdk-fat-layout
 )
 
 if [[ $# -gt 0 ]]; then
