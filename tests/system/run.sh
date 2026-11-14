@@ -38,6 +38,7 @@ DEFAULT_CASES=(
     order-fetch-from-store
     served-install-from-store
     mkcdk-fat-layout
+    mkcdk-fat-consistency
 )
 
 if [[ $# -gt 0 ]]; then
