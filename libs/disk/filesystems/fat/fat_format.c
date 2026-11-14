@@ -423,6 +423,33 @@ static int fatfs_erase_fat(struct fatfs *fs, int is_fat32)
     return 1;
 }
 //-----------------------------------------------------------------------------
+// fatfs_create_volume_label: Root directory entry with the volume label. The boot
+// sector carries the same label, and tools expect the two to match.
+//-----------------------------------------------------------------------------
+static int fatfs_create_volume_label(struct fatfs *fs, uint32 rootdir_lba, const char *name)
+{
+    int i;
+
+    if (name == NULL || name[0] == 0)
+        return 1;
+
+    // The root directory has just been erased, so this sector only holds the label entry
+    memset(fs->currentsector.sector, 0, FAT_SECTOR_SIZE);
+    for (i=0;i<11;i++)
+    {
+        if (i < (int)strlen(name))
+            fs->currentsector.sector[i] = name[i];
+        else
+            fs->currentsector.sector[i] = ' ';
+    }
+    fs->currentsector.sector[11] = FILE_ATTR_VOLUME_ID;
+
+    if (fs->disk_io.write_media(rootdir_lba, fs->currentsector.sector, 1, fs->disk_io.user_ctx))
+        return 1;
+    else
+        return 0;
+}
+//-----------------------------------------------------------------------------
 // fatfs_format_fat16: Format a FAT16 partition
 //-----------------------------------------------------------------------------
 int fatfs_format_fat16(struct fatfs *fs, uint32 volume_sectors, const char *name, uint32 partition_lba)
@@ -467,6 +494,9 @@ int fatfs_format_fat16(struct fatfs *fs, uint32 volume_sectors, const char *name
 
     // Erase Root directory
     if (!fatfs_erase_sectors(fs, fs->lba_begin + fs->rootdir_first_sector, fs->rootdir_sectors))
+        return 0;
+
+    if (!fatfs_create_volume_label(fs, fs->lba_begin + fs->rootdir_first_sector, name))
         return 0;
 
     fs->valid = 1;
@@ -517,6 +547,9 @@ int fatfs_format_fat32(struct fatfs *fs, uint32 volume_sectors, const char *name
 
     // Erase Root directory
     if (!fatfs_erase_sectors(fs, fatfs_lba_of_cluster(fs, fs->rootdir_first_cluster), fs->sectors_per_cluster))
+        return 0;
+
+    if (!fatfs_create_volume_label(fs, fatfs_lba_of_cluster(fs, fs->rootdir_first_cluster), name))
         return 0;
 
     fs->valid = 1;
