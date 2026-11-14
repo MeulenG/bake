@@ -23,6 +23,7 @@
 
 #include "private.h"
 #include "filesystems/fat/fat_filelib.h"
+#include "filesystems/fat/fat_table.h"
 
 struct __fat_filesystem {
     struct chef_disk_filesystem        base;
@@ -35,6 +36,14 @@ struct __fat_filesystem {
     uint16_t                           bytes_per_sector;
     FILE*                              stream;
 };
+
+// Where the boot code starts in a boot sector: 0-2 is the jump, then the BPB, which
+// runs to offset 61 on FAT16 and to offset 89 on FAT32 (drive number, boot signature,
+// volume id, label and filesystem type). The BPB written by the format is kept.
+static int __boot_code_start(struct __fat_filesystem* cfs)
+{
+    return cfs->fs->fat_type == FAT_TYPE_32 ? 90 : 62;
+}
 
 static int __update_mbr(struct __fat_filesystem* cfs, uint8* sector)
 {
@@ -70,11 +79,11 @@ static int __update_mbr(struct __fat_filesystem* cfs, uint8* sector)
     }
 
     // 0-2     - Jump code
-    // 3-61    - EBPB
-    // 62-509  - Boot code
+    // 3-61    - BPB (FAT16), 3-89 on FAT32
+    // 62-509  - Boot code (FAT16), 90-509 on FAT32
     // 510-511 - Boot signature
     memcpy(&sector[0], &((uint8_t*)buffer)[0], 3);
-    memcpy(&sector[62], &((uint8_t*)buffer)[62], 448);
+    memcpy(&sector[__boot_code_start(cfs)], &((uint8_t*)buffer)[__boot_code_start(cfs)], 510 - __boot_code_start(cfs));
     sector[510] = 0x55;
     sector[511] = 0xAA;
 
@@ -261,22 +270,71 @@ static int __fs_write_raw(struct chef_disk_filesystem* fs, struct chef_disk_fs_w
     }
 
     // 0-2     - Jump code
-    // 3-61    - EBPB
-    // 62-509  - Boot code
+    // 3-61    - BPB (FAT16), 3-89 on FAT32
+    // 62-509  - Boot code (FAT16), 90-509 on FAT32
     // 510-511 - Boot signature
     memcpy(&mbr[0], &((uint8_t*)params->buffer)[0], 3);
-    memcpy(&mbr[62], &((uint8_t*)params->buffer)[62], 448);
+    memcpy(&mbr[__boot_code_start(cfs)], &((uint8_t*)params->buffer)[__boot_code_start(cfs)], 510 - __boot_code_start(cfs));
     mbr[510] = 0x55;
     mbr[511] = 0xAA;
     return __partition_write((uint32_t)params->sector, &mbr[0], 1, cfs) == 1 ? 0 : -1;
 }
 
+// The fat library only ever maintains the first FAT and never writes the backup boot
+// sector, so the other FAT copies stay empty and tools like fsck.fat reject the volume.
+// Copy FAT 1 over the others, and on FAT32 the boot sectors 0-2 to the backup location.
+static int __sync_copies(struct __fat_filesystem* cfs)
+{
+    struct fatfs* fatfs = cfs->fs;
+    uint8         sector[FAT_SECTOR_SIZE];
+    uint32        i;
+    uint8         copy;
+
+    // write out FAT sectors still sitting in the library's buffers
+    fatfs_fat_purge(fatfs);
+
+    for (i = 0; i < fatfs->fat_sectors; i++) {
+        if (!__partition_read(fatfs->fat_begin_lba + i, &sector[0], 1, cfs)) {
+            return -1;
+        }
+        for (copy = 1; copy < fatfs->num_of_fats; copy++) {
+            if (!__partition_write(fatfs->fat_begin_lba + (copy * fatfs->fat_sectors) + i, &sector[0], 1, cfs)) {
+                return -1;
+            }
+        }
+    }
+
+    if (fatfs->fat_type == FAT_TYPE_32) {
+        uint16 backup;
+
+        if (!__partition_read(0, &sector[0], 1, cfs)) {
+            return -1;
+        }
+        backup = (uint16)sector[50] | ((uint16)sector[51] << 8); // BPB_BkBootSec
+        if (backup == 0) {
+            return 0;
+        }
+        for (i = 0; i < 3; i++) {
+            if (!__partition_read(i, &sector[0], 1, cfs) || !__partition_write(backup + i, &sector[0], 1, cfs)) {
+                return -1;
+            }
+        }
+    }
+    return 0;
+}
+
 static int __fs_finish(struct chef_disk_filesystem* fs)
 {
     struct __fat_filesystem* cfs = (struct __fat_filesystem*)fs;
+    int                      status;
+
+    status = __sync_copies(cfs);
+    if (status) {
+        VLOG_ERROR("fat", "__fs_finish: failed to write the FAT copies and backup boot sector\n");
+    }
     fl_delete(cfs->fs);
     free(cfs);
-    return 0;
+    return status;
 }
 
 struct chef_disk_filesystem* chef_filesystem_fat32_new(struct chef_disk_partition* partition, struct chef_disk_filesystem_params* params)
