@@ -284,9 +284,9 @@ static int __write_gpt_tables(struct chef_diskbuilder* builder)
 
     // The backup partition table occupies the sectors immediately before the
     // backup header at the end of the disk.
-    fseek(
+    __disk_fseek(
         builder->image_stream, 
-        (long)(builder->disk_geometry.bytes_per_sector
+        (long long)(builder->disk_geometry.bytes_per_sector
             * (builder->disk_geometry.sector_count - (1 + sectorsForTable))),
         SEEK_SET
     );
@@ -303,9 +303,9 @@ static int __write_gpt_tables(struct chef_diskbuilder* builder)
     }
 
     // Write the backup header in the final sector.
-    fseek(
+    __disk_fseek(
         builder->image_stream,
-        (long)(builder->disk_geometry.bytes_per_sector
+        (long long)(builder->disk_geometry.bytes_per_sector
             * (builder->disk_geometry.sector_count - 1)),
         SEEK_SET
     );
@@ -437,7 +437,7 @@ static int __write_partition(struct chef_disk_partition* p, unsigned int sectorS
     VLOG_DEBUG("disk", "__write_partition(name=%s)\n", p->name);
 
     // seek to first sector
-    fseek(stream, (long)(p->sector_start * sectorSize), SEEK_SET);
+    __disk_fseek(stream, (long long)(p->sector_start * sectorSize), SEEK_SET);
     fseek(p->stream, 0, SEEK_SET);
 
     // allocate a 4mb block for transfers
@@ -599,7 +599,7 @@ struct chef_disk_partition* chef_diskbuilder_partition_new(struct chef_diskbuild
     setvbuf(p->stream, NULL, _IONBF, 0);
 
     VLOG_DEBUG("disk", "chef_diskbuilder_partition_new: resizing stream to %llu\n", p->sector_count * builder->disk_geometry.bytes_per_sector);
-    status = platform_chsize(fileno(p->stream), (long)(p->sector_count * builder->disk_geometry.bytes_per_sector));
+    status = platform_chsize(fileno(p->stream), (long long)(p->sector_count * builder->disk_geometry.bytes_per_sector));
     if (status) {
         VLOG_ERROR("disk", "chef_diskbuilder_partition_new: failed to resize stream %s\n", &tmp[0]);
         fclose(p->stream);

@@ -19,7 +19,7 @@
 #include <chef/platform.h>
 #include <io.h>
 
-int platform_chsize(int fd, long size)
+int platform_chsize(int fd, long long size)
 {
-	return _chsize(fd, size);
+	return _chsize_s(fd, size) == 0 ? 0 : -1;
 }

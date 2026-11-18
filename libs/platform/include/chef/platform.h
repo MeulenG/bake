@@ -415,7 +415,7 @@ extern int platform_stat(const char* path, struct platform_stat* stats);
  * @param[in] size Requested size in bytes.
  * @return Zero on success and -1 on failure.
  */
-extern int platform_chsize(int fd, long size);
+extern int platform_chsize(int fd, long long size);
 
 /**
  * @brief Read the stored target of a symbolic link.
