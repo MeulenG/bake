@@ -26,6 +26,7 @@
 #include <errno.h>
 #include <vlog.h>
 
+#include "server/vafs_manager.h"
 #include "private.h"
 
 #if defined(__linux__)
@@ -158,7 +159,13 @@ int register_server_link(gracht_server_t* server)
         return status;
     }
 
-    status = init_link_config(apiLink, gracht_link_packet_based, &apiAddress);
+        status = init_link_config(apiLink,
+    #if defined(_WIN32)
+        gracht_link_stream_based,
+    #else
+        gracht_link_packet_based,
+    #endif
+        &apiAddress);
     if (status) {
         fprintf(stderr, "register_server_link failed to initialize api link: %i (%i)\n", status, errno);
         return status;
@@ -220,6 +227,12 @@ int cvd_initialize_server(struct gracht_server_configuration* config, gracht_ser
 
     // Initialize BPF manager for eBPF-based security enforcement
     __initialize_bpf();
+
+    if (cvd_vafs_mount_manager_initialize() != 0) {
+        VLOG_ERROR("cvd", "failed to initialize VaFS mount manager\n");
+        return -1;
+    }
+    atexit(cvd_vafs_mount_manager_shutdown);
 
     VLOG_TRACE("cvd", "Creating gracht server handler\n");
     status = gracht_server_create(config, serverOut);

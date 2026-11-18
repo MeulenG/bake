@@ -22,6 +22,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
+
 #include "chef-config.h"
 
 static void __print_help(void)
@@ -100,18 +101,17 @@ static int __spawn_command(int argc, char** argv, char** envp, const char* conta
 // invoked as <serve-exec-path> --container <container-name> --path <path-inside-container> --wdir <working-directory> <arguments-for-internal-command>
 int main(int argc, char** argv, char** envp)
 {
-    const char* containerName = NULL;
-    const char* commandPath   = NULL;
+    const char* containerName    = NULL;
+    const char* commandPath      = NULL;
     const char* workingDirectory = NULL;
-    int         argIndex      = 1;
+    int         argIndex         = 1;
     int         status;
 
     if (argc > 1) {
         if (!strcmp(argv[1], "-h") || !strcmp(argv[1], "--help")) {
             __print_help();
             return 0;
-        }
-        if (!strcmp(argv[1], "-v") || !strcmp(argv[1], "--version")) {
+        } else if (!strcmp(argv[1], "--version")) {
             printf("serve-exec: version " PROJECT_VER "\n");
             return 0;
         }

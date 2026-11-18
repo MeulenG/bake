@@ -26,10 +26,14 @@ extern int test_recipe_platforms(void);
 extern int test_recipe_ingredients(void);
 extern int test_recipe_parts_and_steps(void);
 extern int test_recipe_packs(void);
+extern int test_recipe_toolchain_pack(void);
 extern int test_recipe_pack_commands(void);
 extern int test_recipe_pack_capabilities(void);
 extern int test_recipe_environment(void);
 extern int test_recipe_full(void);
+
+extern int test_recipe_combined_build(void);
+extern int test_recipe_invalid_configure(void);
 
 // image parser tests
 extern int test_image_mbr_minimal(void);
@@ -38,11 +42,15 @@ extern int test_image_partition_sources(void);
 extern int test_image_partition_attributes(void);
 extern int test_image_fat_options(void);
 extern int test_image_multiple_partitions(void);
+extern int test_image_partition_size_suffix(void);
 extern int test_image_full(void);
 
 // package manifest tests
 extern int test_package_manifest_application_roundtrip(void);
+extern int test_package_image_empty_and_symlink_only(void);
 extern int test_package_manifest_ingredient_roundtrip(void);
+extern int test_package_manifest_toolchain_roundtrip(void);
+extern int test_package_manifest_rejects_malformed_toolchain_metadata(void);
 
 typedef struct {
     const char* name;
@@ -57,10 +65,14 @@ static const test_case_t tests[] = {
     {"Recipe: ingredients",          test_recipe_ingredients},
     {"Recipe: parts and steps",      test_recipe_parts_and_steps},
     {"Recipe: packs",                test_recipe_packs},
+    {"Recipe: toolchain pack",       test_recipe_toolchain_pack},
     {"Recipe: pack commands",        test_recipe_pack_commands},
     {"Recipe: pack capabilities",    test_recipe_pack_capabilities},
     {"Recipe: environment",          test_recipe_environment},
     {"Recipe: full",                 test_recipe_full},
+
+    {"Recipe: combined build", test_recipe_combined_build},
+    {"Recipe: invalid configure", test_recipe_invalid_configure},
 
     // image tests
     {"Image: MBR minimal",          test_image_mbr_minimal},
@@ -69,11 +81,15 @@ static const test_case_t tests[] = {
     {"Image: partition attributes",  test_image_partition_attributes},
     {"Image: FAT options",           test_image_fat_options},
     {"Image: multiple partitions",   test_image_multiple_partitions},
+    {"Image: partition size suffix", test_image_partition_size_suffix},
     {"Image: full",                  test_image_full},
 
     // package manifest tests
+    {"Package image: empty and symlink-only", test_package_image_empty_and_symlink_only},
     {"Package manifest: application roundtrip", test_package_manifest_application_roundtrip},
     {"Package manifest: ingredient roundtrip", test_package_manifest_ingredient_roundtrip},
+    {"Package manifest: toolchain roundtrip", test_package_manifest_toolchain_roundtrip},
+    {"Package manifest: malformed toolchain metadata", test_package_manifest_rejects_malformed_toolchain_metadata},
 };
 
 static const size_t num_tests = sizeof(tests) / sizeof(tests[0]);

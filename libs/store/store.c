@@ -191,6 +191,10 @@ static int __find_package_in_inventory(struct store_package* package, struct sto
         &pack
     );
 
+    if (status == 0 && packOut != NULL) {
+        *packOut = pack;
+    }
+
     strsplit_free(names);
     return status;
 }
@@ -270,6 +274,9 @@ int store_ensure_package(struct store_package* package, struct chef_observer* ob
     }
 
 cleanup:
+    // Update the resolved revision, on errors this
+    // will be 0'ed
+    package->revision = revision;
     strsplit_free(names);
     free(pathTmp);
     free(path);
@@ -282,11 +289,6 @@ int store_package_path(struct store_package* package, const char** pathOut)
     char**                       names;
     int                          status;
     VLOG_DEBUG("store", "store_package_path(name=%s)\n", package->name);
-
-    if (package->revision == 0) {
-        VLOG_ERROR("store", "store_package_path: revision is required\n");
-        return -1;
-    }
 
     // split the publisher/package
     names = __split_name(package->name);
@@ -301,7 +303,7 @@ int store_package_path(struct store_package* package, const char** pathOut)
         goto cleanup;
     }
 
-    *pathOut = __format_package_path(names[0], names[1], package->revision);
+    *pathOut = inventory_pack_path(pack);
 
 cleanup:
     strsplit_free(names);

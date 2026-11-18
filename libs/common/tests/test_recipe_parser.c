@@ -137,6 +137,7 @@ int test_recipe_platforms(void)
         "platforms:\n"
         "- name: linux\n"
         "  base: ubuntu-22.04\n"
+        "  target: vali\n"
         "  toolchain: my-toolchain\n"
         "  architectures:\n"
         "  - x86_64\n"
@@ -156,6 +157,7 @@ int test_recipe_platforms(void)
     TEST_ASSERT(plat != NULL, "platform should not be NULL");
     TEST_ASSERT(strcmp(plat->name, "linux") == 0, "platform name should be 'linux'");
     TEST_ASSERT(strcmp(plat->base, "ubuntu-22.04") == 0, "platform base should be 'ubuntu-22.04'");
+    TEST_ASSERT(strcmp(plat->target, "vali") == 0, "platform target should be 'vali'");
     TEST_ASSERT(strcmp(plat->toolchain, "my-toolchain") == 0, "platform toolchain should match");
     TEST_ASSERT(plat->archs.count == 2, "platform should have 2 archs");
 
@@ -398,6 +400,51 @@ int test_recipe_packs(void)
     struct list_item_string* lflags =
         (struct list_item_string*)pack->options.linker_flags.head;
     TEST_ASSERT(strcmp(lflags->value, "-lm") == 0, "linker flag should be '-lm'");
+
+    recipe_destroy(recipe);
+    return 0;
+}
+
+int test_recipe_toolchain_pack(void)
+{
+    struct recipe* recipe = NULL;
+    const char* yaml =
+        "name: toolchain-test\n"
+        "author: Test\n"
+        "email: test@test.com\n"
+        "version: 1.0.0\n"
+        "\n"
+        "packs:\n"
+        "- name: clang-cc\n"
+        "  summary: LLVM toolchain\n"
+        "  type: toolchain\n"
+        "  toolchain:\n"
+        "    root: usr/local\n"
+        "    cc: bin/clang\n"
+        "    cxx: bin/clang++\n"
+        "    ar: bin/llvm-ar\n"
+        "    ranlib: bin/llvm-ranlib\n"
+        "    llvm-config: bin/llvm-config\n"
+        "    targets:\n"
+        "    - name: vali\n"
+        "      triple: $[[ CHEF_TARGET_ARCHITECTURE ]]-uml-vali\n"
+            "      compiler-args: [\"--target=$[[ TOOLCHAIN_TARGET_TRIPLE ]]\"]\n";
+    struct recipe_pack* pack;
+
+    TEST_ASSERT(__parse_recipe(yaml, &recipe) == 0, "recipe_parse should succeed");
+
+    pack = (struct recipe_pack*)recipe->packs.head;
+    TEST_ASSERT(pack != NULL, "toolchain pack should exist");
+    TEST_ASSERT(pack->type == CHEF_PACKAGE_TYPE_TOOLCHAIN, "pack type should be TOOLCHAIN");
+    TEST_ASSERT(strcmp(pack->toolchain.root, "usr/local") == 0, "toolchain root should match");
+    TEST_ASSERT(strcmp(pack->toolchain.cc, "bin/clang") == 0, "toolchain cc should match");
+    TEST_ASSERT(strcmp(pack->toolchain.cxx, "bin/clang++") == 0, "toolchain cxx should match");
+    struct recipe_pack_toolchain_target* target =
+        (struct recipe_pack_toolchain_target*)pack->toolchain.targets.head;
+    TEST_ASSERT(target != NULL, "toolchain target should exist");
+    TEST_ASSERT(strcmp(target->name, "vali") == 0, "target name should match");
+    TEST_ASSERT(strcmp(target->triple,
+        "$[[ CHEF_TARGET_ARCHITECTURE ]]-uml-vali") == 0, "target triple should match");
 
     recipe_destroy(recipe);
     return 0;
@@ -682,5 +729,63 @@ int test_recipe_full(void)
         "second pack should have 1 filter");
 
     recipe_destroy(recipe);
+    return 0;
+}
+
+int test_recipe_combined_build(void)
+{
+    struct recipe* recipe = NULL;
+    const char* yaml =
+        "name: combined\nauthor: Test\nemail: test@test.com\nversion: 1.0.0\n"
+        "recipes:\n- name: app\n  steps:\n"
+        "  - name: default\n    type: build\n    system: cmake\n"
+        "  - name: custom\n    configure:\n"
+        "      arguments: [-DFEATURE=ON]\n"
+        "      env: {MODE: configure}\n"
+        "    type: build\n    system: cmake\n"
+        "    arguments: [--parallel, '2']\n    env: {MODE: build}\n"
+        "  - name: prepared\n    type: build\n    system: autotools\n    configure: false\n"
+        "  - name: enabled\n    type: build\n    system: autoconf\n    configure: true\n"
+        "  - name: empty\n    type: build\n    system: cmake\n    configure: {}\n"
+        "packs:\n- name: combined\n  summary: Test\n  type: ingredient\n";
+    TEST_ASSERT(__parse_recipe(yaml, &recipe) == 0, "combined recipe should parse");
+    struct recipe_part* part = (struct recipe_part*)recipe->parts.head;
+    struct recipe_step* step = (struct recipe_step*)__list_nth(&part->steps, 0);
+    TEST_ASSERT(!step->configure.specified && !step->configure.disabled, "generation defaults to enabled");
+    step = (struct recipe_step*)__list_nth(&part->steps, 1);
+    TEST_ASSERT(step->configure.specified && !step->configure.disabled, "nested settings enable generation");
+    TEST_ASSERT(step->arguments.count == 2 && step->configure.arguments.count == 1, "phase arguments stay separate");
+    TEST_ASSERT(!strcmp(((struct chef_keypair_item*)step->env_keypairs.head)->value, "build"), "shared environment preserved");
+    TEST_ASSERT(!strcmp(((struct chef_keypair_item*)step->configure.env_keypairs.head)->value, "configure"), "generation environment separated");
+    step = (struct recipe_step*)__list_nth(&part->steps, 2);
+    TEST_ASSERT(step->configure.disabled, "false disables generation");
+    step = (struct recipe_step*)__list_nth(&part->steps, 3);
+    TEST_ASSERT(step->configure.specified && !step->configure.disabled, "true enables generation");
+    step = (struct recipe_step*)__list_nth(&part->steps, 4);
+    TEST_ASSERT(step->configure.specified && !step->configure.disabled, "empty settings enable generation");
+    recipe_destroy(recipe);
+    return 0;
+}
+
+int test_recipe_invalid_configure(void)
+{
+    const char* steps[] = {
+        "type: build\n    system: cmake\n    configure: nonsense\n",
+        "type: build\n    system: cmake\n    configure: [false]\n",
+        "type: build\n    system: cmake\n    configure: {unknown: value}\n",
+        "type: build\n    system: cmake\n    configure: {false: value}\n",
+        "type: build\n    system: make\n    configure: {}\n",
+        "type: generate\n    system: cmake\n    configure: {}\n",
+        "type: script\n    configure: false\n",
+        "type: build\n    system: cmake\n    configure: true\n    configure: false\n"
+    };
+    for (size_t i = 0; i < sizeof(steps) / sizeof(steps[0]); i++) {
+        char yaml[1024];
+        struct recipe* recipe = NULL;
+        snprintf(yaml, sizeof(yaml),
+            "name: invalid\nauthor: Test\nemail: test@test.com\nversion: 1.0.0\n"
+            "recipes:\n- name: app\n  steps:\n  - name: test\n    %s", steps[i]);
+        TEST_ASSERT(__parse_recipe(yaml, &recipe) != 0, "invalid configure settings should be rejected");
+    }
     return 0;
 }

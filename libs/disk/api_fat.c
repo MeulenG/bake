@@ -36,6 +36,38 @@ struct __fat_filesystem {
     FILE*                              stream;
 };
 
+static int __normalize_path(const char* path, char* normalized, size_t length)
+{
+    size_t len;
+
+    if (path == NULL || normalized == NULL || length == 0) {
+        return -1;
+    }
+
+    len = strlen(path);
+    while (len > 1 && path[len - 1] == '/') {
+        len--;
+    }
+
+    if (path[0] == '/') {
+        if (len >= length) {
+            return -1;
+        }
+        memcpy(normalized, path, len);
+        normalized[len] = '\0';
+        return 0;
+    }
+
+    if (len + 1 >= length) {
+        return -1;
+    }
+
+    normalized[0] = '/';
+    memcpy(normalized + 1, path, len);
+    normalized[len + 1] = '\0';
+    return 0;
+}
+
 static int __update_mbr(struct __fat_filesystem* cfs, uint8* sector)
 {
     struct platform_stat stats;
@@ -114,7 +146,7 @@ static int __write_reserved_image(struct __fat_filesystem* cfs)
         return status;
     }
 
-    written = fwrite(buffer, size, 1, cfs->stream);
+    written = fwrite(buffer, 1, size, cfs->stream);
     if (written != size) {
         VLOG_ERROR("fat", "__write_reserved_image: failed to write reserved sectors\n");
         free(buffer);
@@ -136,7 +168,9 @@ static int __partition_read(uint32 sector, uint8 *buffer, uint32 sector_count, v
     offset = sector * cfs->bytes_per_sector;
     status = fseek(cfs->stream, (long)offset, SEEK_SET);
 
-    fread(buffer, cfs->bytes_per_sector, sector_count, cfs->stream);
+    if (fread(buffer, cfs->bytes_per_sector, sector_count, cfs->stream) != sector_count) {
+        return 0;
+    }
     return 1;
 }
 
@@ -161,7 +195,9 @@ static int __partition_write(uint32 sector, uint8 *buffer, uint32 sector_count, 
         }
     }
 
-    fwrite(buffer, cfs->bytes_per_sector, sector_count, cfs->stream);
+    if (fwrite(buffer, cfs->bytes_per_sector, sector_count, cfs->stream) != sector_count) {
+        return 0;
+    }
 
     // let us write the reserved image contents
     // at the same time
@@ -203,28 +239,67 @@ static int __fs_format(struct chef_disk_filesystem* fs)
     }
     // fat library will always return 1 for success, 0 for failure
     // we need to invert that to match api expectations
-    return fl_format(cfs->fs, (uint32_t)cfs->sector_count, cfs->label, (uint32_t)cfs->sector_start) == 1 ? 0 : -1;
+    return fl_format(cfs->fs, (uint32_t)cfs->sector_count, cfs->label, 0) == 1 ? 0 : -1;
 }
 
 static int __fs_create_directory(struct chef_disk_filesystem* fs, struct chef_disk_fs_create_directory_params* params)
 {
     struct __fat_filesystem* cfs = (struct __fat_filesystem*)fs;
-    return fl_createdirectory(cfs->fs, params->path) == 0 ? -1 : 0;
+    char                     path[PATH_MAX];
+    int                      status;
+    VLOG_DEBUG("fat", "__fs_create_directory(path=%s)\n", params->path);
+
+    // normalize the path for FAT
+    if (__normalize_path(params->path, &path[0], sizeof(path)) != 0) {
+        return -1;
+    }
+
+    // if the path is the root directory, we don't need to create it
+    if (strcmp(&path[0], "/") == 0) {
+        return 0;
+    }
+    
+    // fat library will always return 1 for success, 0 for failure
+    // we need to invert that to match api expectations
+
+    // check if the directory already exists
+    status = fl_is_dir(cfs->fs, &path[0]);
+    if (status) {
+        VLOG_DEBUG("fat", "__fs_create_directory: existing %s: yes\n", &path[0]);
+        return 0;
+    }
+
+    // create the directory since it does not exist
+    status = fl_createdirectory(cfs->fs, &path[0]);
+    if (status != 0) {
+        VLOG_DEBUG("fat", "__fs_create_directory: created %s\n", &path[0]);
+        return 0;
+    }
+    return -1;
 }
 
 static int __fs_create_file(struct chef_disk_filesystem* fs, struct chef_disk_fs_create_file_params* params)
 {
     struct __fat_filesystem* cfs = (struct __fat_filesystem*)fs;
+    char                     path[PATH_MAX];
     FL_FILE*                 stream;
     int                      written;
+    VLOG_DEBUG("fat", "__fs_create_file(path=%s)\n", params->path);
 
-    stream = fl_fopen(cfs->fs, params->path, "w");
+    // normalize the path for FAT
+    if (__normalize_path(params->path, &path[0], sizeof(path)) != 0) {
+        return -1;
+    }
+
+    stream = fl_fopen(cfs->fs, &path[0], "w");
     if (stream == NULL) {
+        VLOG_ERROR("fat", "__fs_create_file: failed to open %s for writing\n", &path[0]);
         return -1;
     }
 
     written = fl_fwrite(cfs->fs, params->buffer, 1, (uint32_t)params->size, stream);
     if (written != (int)params->size) {
+        VLOG_ERROR("fat", "__fs_create_file: wrote %d of %zu bytes to %s\n", written, params->size, &path[0]);
         fl_fclose(cfs->fs, stream);
         return -1;
     }

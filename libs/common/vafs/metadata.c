@@ -18,13 +18,15 @@
 
 #include <chef/package_manifest.h>
 #include <chef/platform.h>
+#include <chef/vafs.h>
 #include <chef/utils_vafs.h>
 #include <errno.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <vafs/vafs.h>
+#include <vafs/builder.h>
+#include <vafs/reader.h>
 #include <vlog.h>
 
 static struct VaFsGuid g_headerGuid       = CHEF_PACKAGE_HEADER_GUID;
@@ -32,6 +34,7 @@ static struct VaFsGuid g_versionGuid      = CHEF_PACKAGE_VERSION_GUID;
 static struct VaFsGuid g_iconGuid         = CHEF_PACKAGE_ICON_GUID;
 static struct VaFsGuid g_commandsGuid     = CHEF_PACKAGE_APPS_GUID;
 static struct VaFsGuid g_optionsGuid      = CHEF_PACKAGE_INGREDIENT_OPTS_GUID;
+static struct VaFsGuid g_toolchainGuid    = CHEF_PACKAGE_TOOLCHAIN_OPTS_GUID;
 static struct VaFsGuid g_networkGuid      = CHEF_PACKAGE_NETWORK_GUID;
 static struct VaFsGuid g_capabilitiesGuid = CHEF_PACKAGE_CAPABILITIES_GUID;
 
@@ -134,6 +137,20 @@ static void __free_manifest_contents(struct chef_package_manifest* manifest)
     free((void*)manifest->icon.data);
     free((void*)manifest->application.network_gateway);
     free((void*)manifest->application.network_dns);
+    free((void*)manifest->toolchain.root);
+    free((void*)manifest->toolchain.cc);
+    free((void*)manifest->toolchain.cxx);
+    free((void*)manifest->toolchain.ar);
+    free((void*)manifest->toolchain.ranlib);
+    free((void*)manifest->toolchain.strip);
+    free((void*)manifest->toolchain.llvm_config);
+    free((void*)manifest->toolchain.cmake_file);
+    for (i = 0; i < manifest->toolchain.targets_count; i++) {
+        free((void*)manifest->toolchain.targets[i].name);
+        free((void*)manifest->toolchain.targets[i].triple);
+        __free_string_array(&manifest->toolchain.targets[i].compiler_args);
+    }
+    free(manifest->toolchain.targets);
 
     __free_string_array(&manifest->ingredient.bin_dirs);
     __free_string_array(&manifest->ingredient.inc_dirs);
@@ -379,7 +396,7 @@ static int __write_header_metadata(struct VaFs* vafs, const struct chef_package_
 
 #undef WRITE_MANIFEST_STRING
 
-    status = vafs_feature_add(vafs, &packageHeader->header);
+    status = vafs_builder_add_feature(vafs, &packageHeader->header);
     free(packageHeader);
     if (status != 0) {
         VLOG_ERROR("bake", "failed to write package header\n");
@@ -417,7 +434,7 @@ static int __write_version_metadata(struct VaFs* vafs, const struct chef_version
         );
     }
 
-    status = vafs_feature_add(vafs, &packageVersion->header);
+    status = vafs_builder_add_feature(vafs, &packageVersion->header);
     free(packageVersion);
     return status;
 }
@@ -443,7 +460,7 @@ static int __write_icon_metadata(struct VaFs* vafs, const struct chef_package_bl
     packageIcon->header.Length = (uint32_t)featureSize;
     memcpy((char*)packageIcon + sizeof(struct chef_vafs_feature_package_icon), icon->data, icon->size);
 
-    status = vafs_feature_add(vafs, &packageIcon->header);
+    status = vafs_builder_add_feature(vafs, &packageIcon->header);
     free(packageIcon);
     return status;
 }
@@ -530,7 +547,7 @@ static int __write_commands_metadata(struct VaFs* vafs, const struct chef_packag
         buffer += __serialize_command(&manifest->commands[i], buffer);
     }
 
-    status = vafs_feature_add(vafs, &packageApps->header);
+    status = vafs_builder_add_feature(vafs, &packageApps->header);
     free(packageApps);
     return status;
 }
@@ -607,13 +624,99 @@ static int __write_ingredient_options_metadata(struct VaFs* vafs, const struct c
 
 #undef WRITE_OPTIONAL_BUFFER
 
-    status = vafs_feature_add(vafs, &optionsFeature->header);
+    status = vafs_builder_add_feature(vafs, &optionsFeature->header);
     free(optionsFeature);
     free(bins);
     free(incs);
     free(libs);
     free(compilerFlags);
     free(linkerFlags);
+    return status;
+}
+
+static int __write_toolchain_options_metadata(struct VaFs* vafs, const struct chef_package_manifest* manifest)
+{
+    struct chef_vafs_feature_toolchain_opts* feature;
+    uint32_t*                                lengths;
+    char*                                    data;
+    size_t                                   totalSize = sizeof(struct chef_vafs_feature_toolchain_opts);
+    int                                      status;
+    
+    const char* values[] = {
+        manifest->toolchain.root, manifest->toolchain.cc, manifest->toolchain.cxx,
+        manifest->toolchain.ar, manifest->toolchain.ranlib, manifest->toolchain.strip,
+        manifest->toolchain.llvm_config, manifest->toolchain.cmake_file
+    };
+
+    if (manifest->type != CHEF_PACKAGE_TYPE_TOOLCHAIN) {
+        return 0;
+    }
+
+    for (size_t i = 0; i < sizeof(values) / sizeof(values[0]); i++) {
+        totalSize += __safe_strlen(values[i]);
+    }
+    
+    for (size_t i = 0; i < manifest->toolchain.targets_count; i++) {
+        const struct chef_package_manifest_toolchain_target* target = &manifest->toolchain.targets[i];
+        totalSize += sizeof(struct chef_vafs_toolchain_target) + __safe_strlen(target->name) +
+            __safe_strlen(target->triple);
+        for (size_t j = 0; j < target->compiler_args.count; j++) {
+            totalSize += sizeof(uint32_t) + __safe_strlen(target->compiler_args.values[j]);
+        }
+    }
+
+    feature = calloc(1, totalSize);
+    if (feature == NULL) {
+        errno = ENOMEM;
+        return -1;
+    }
+
+    memcpy(&feature->header.Guid, &g_toolchainGuid, sizeof(struct VaFsGuid));
+    feature->header.Length = (uint32_t)totalSize;
+    lengths = &feature->root_length;
+    data = (char*)feature + sizeof(*feature);
+    for (size_t i = 0; i < sizeof(values) / sizeof(values[0]); i++) {
+        lengths[i] = (uint32_t)__safe_strlen(values[i]);
+        if (lengths[i] > 0) {
+            memcpy(data, values[i], lengths[i]);
+            data += lengths[i];
+        }
+    }
+
+    feature->targets_count = (uint32_t)manifest->toolchain.targets_count;
+    for (size_t i = 0; i < manifest->toolchain.targets_count; i++) {
+        const struct chef_package_manifest_toolchain_target* target 
+            = &manifest->toolchain.targets[i];
+        struct chef_vafs_toolchain_target*                   targetFeature 
+            = (struct chef_vafs_toolchain_target*)data;
+
+        targetFeature->name_length = (uint32_t)__safe_strlen(target->name);
+        targetFeature->triple_length = (uint32_t)__safe_strlen(target->triple);
+        targetFeature->compiler_args_count = (uint32_t)target->compiler_args.count;
+        data += sizeof(*targetFeature);
+        if (targetFeature->name_length > 0) {
+            memcpy(data, target->name, targetFeature->name_length);
+            data += targetFeature->name_length;
+        }
+        if (targetFeature->triple_length > 0) {
+            memcpy(data, target->triple, targetFeature->triple_length);
+            data += targetFeature->triple_length;
+        }
+        
+        for (size_t j = 0; j < target->compiler_args.count; j++) {
+            uint32_t argumentLength = (uint32_t)__safe_strlen(target->compiler_args.values[j]);
+
+            memcpy(data, &argumentLength, sizeof(argumentLength));
+            data += sizeof(argumentLength);
+            if (argumentLength > 0) {
+                memcpy(data, target->compiler_args.values[j], argumentLength);
+                data += argumentLength;
+            }
+        }
+    }
+
+    status = vafs_builder_add_feature(vafs, &feature->header);
+    free(feature);
     return status;
 }
 
@@ -657,7 +760,7 @@ static int __write_network_metadata(struct VaFs* vafs, const struct chef_package
         memcpy(data, manifest->application.network_dns, dnsLength);
     }
 
-    status = vafs_feature_add(vafs, &network->header);
+    status = vafs_builder_add_feature(vafs, &network->header);
     free(network);
     return status;
 }
@@ -739,7 +842,7 @@ static int __write_capabilities_metadata(struct VaFs* vafs, const struct chef_pa
         buffer += __serialize_capability(&manifest->capabilities[i], buffer);
     }
 
-    status = vafs_feature_add(vafs, &feature->header);
+    status = vafs_builder_add_feature(vafs, &feature->header);
     free(feature);
     return status;
 }
@@ -750,7 +853,7 @@ static int __load_package_header(struct VaFs* vafs, struct chef_package_manifest
     char*                                    data;
     int                                      status;
 
-    status = vafs_feature_query(vafs, &g_headerGuid, (struct VaFsFeatureHeader**)&header);
+    status = vafs_reader_query_feature(vafs, &g_headerGuid, (struct VaFsFeatureHeader**)&header);
     if (status != 0) {
         return status;
     }
@@ -785,7 +888,7 @@ static int __load_package_version(struct VaFs* vafs, struct chef_package_manifes
     struct chef_vafs_feature_package_version* header;
     int                                       status;
 
-    status = vafs_feature_query(vafs, &g_versionGuid, (struct VaFsFeatureHeader**)&header);
+    status = vafs_reader_query_feature(vafs, &g_versionGuid, (struct VaFsFeatureHeader**)&header);
     if (status != 0) {
         return status;
     }
@@ -813,7 +916,7 @@ static int __load_icon_metadata(struct VaFs* vafs, struct chef_package_manifest*
     size_t                                 iconSize;
     int                                    status;
 
-    status = vafs_feature_query(vafs, &g_iconGuid, (struct VaFsFeatureHeader**)&header);
+    status = vafs_reader_query_feature(vafs, &g_iconGuid, (struct VaFsFeatureHeader**)&header);
     if (status != 0) {
         return 0;
     }
@@ -838,7 +941,7 @@ static int __load_commands_metadata(struct VaFs* vafs, struct chef_package_manif
     int                                    status;
     int                                    i;
 
-    status = vafs_feature_query(vafs, &g_commandsGuid, (struct VaFsFeatureHeader**)&header);
+    status = vafs_reader_query_feature(vafs, &g_commandsGuid, (struct VaFsFeatureHeader**)&header);
     if (status != 0) {
         return 0;
     }
@@ -896,7 +999,7 @@ static int __load_ingredient_options_metadata(struct VaFs* vafs, struct chef_pac
     char*                                     data;
     int                                       status;
 
-    status = vafs_feature_query(vafs, &g_optionsGuid, (struct VaFsFeatureHeader**)&header);
+    status = vafs_reader_query_feature(vafs, &g_optionsGuid, (struct VaFsFeatureHeader**)&header);
     if (status != 0) {
         return 0;
     }
@@ -924,13 +1027,144 @@ static int __load_ingredient_options_metadata(struct VaFs* vafs, struct chef_pac
     return 0;
 }
 
+static int __load_toolchain_options_metadata(struct VaFs* vafs, struct chef_package_manifest* manifest)
+{
+    struct chef_vafs_feature_toolchain_opts* header;
+    uint32_t*                                lengths;
+    char*                                    data;
+    size_t                                   remaining;
+    int                                      status;
+
+    char** values[] = {
+        (char**)&manifest->toolchain.root, (char**)&manifest->toolchain.cc,
+        (char**)&manifest->toolchain.cxx, (char**)&manifest->toolchain.ar,
+        (char**)&manifest->toolchain.ranlib, (char**)&manifest->toolchain.strip,
+        (char**)&manifest->toolchain.llvm_config, (char**)&manifest->toolchain.cmake_file
+    };
+
+    status = vafs_reader_query_feature(vafs, &g_toolchainGuid, (struct VaFsFeatureHeader**)&header);
+    if (status != 0) {
+        return 0;
+    }
+
+    if (header->header.Length < sizeof(*header)) {
+        errno = EINVAL;
+        return -1;
+    }
+
+    lengths = &header->root_length;
+    data = (char*)header + sizeof(*header);
+    remaining = header->header.Length - sizeof(*header);
+    
+    for (size_t i = 0; i < sizeof(values) / sizeof(values[0]); i++) {
+        if (lengths[i] > remaining) {
+            errno = EINVAL;
+            return -1;
+        }
+        if (__copy_manifest_string(values[i], data, lengths[i]) != 0) {
+            return -1;
+        }
+        data += lengths[i];
+        remaining -= lengths[i];
+    }
+    
+    if (header->targets_count == 0) {
+        return 0;
+    }
+
+    if (header->targets_count > remaining / sizeof(struct chef_vafs_toolchain_target)) {
+        errno = EINVAL;
+        return -1;
+    }
+    
+    manifest->toolchain.targets = calloc(header->targets_count,
+        sizeof(struct chef_package_manifest_toolchain_target));
+    if (manifest->toolchain.targets == NULL) {
+        errno = ENOMEM;
+        return -1;
+    }
+    
+    manifest->toolchain.targets_count = header->targets_count;
+    
+    for (size_t i = 0; i < header->targets_count; i++) {
+        struct chef_vafs_toolchain_target*             targetFeature 
+            = (struct chef_vafs_toolchain_target*)data;
+        struct chef_package_manifest_toolchain_target* target 
+            = &manifest->toolchain.targets[i];
+
+        if (remaining < sizeof(*targetFeature)) {
+            errno = EINVAL;
+            return -1;
+        }
+        data += sizeof(*targetFeature);
+        remaining -= sizeof(*targetFeature);
+        
+        if (targetFeature->name_length > remaining) {
+            errno = EINVAL;
+            return -1;
+        }
+        if (__copy_manifest_string((char**)&target->name, data, targetFeature->name_length) != 0) {
+            return -1;
+        }
+        data += targetFeature->name_length;
+        remaining -= targetFeature->name_length;
+        
+        if (targetFeature->triple_length > remaining) {
+            errno = EINVAL;
+            return -1;
+        }
+        if (__copy_manifest_string((char**)&target->triple, data, targetFeature->triple_length) != 0) {
+            return -1;
+        }
+        data += targetFeature->triple_length;
+        remaining -= targetFeature->triple_length;
+
+        if (targetFeature->compiler_args_count > remaining / sizeof(uint32_t)) {
+            errno = EINVAL;
+            return -1;
+        }
+        
+        if (targetFeature->compiler_args_count > 0) {
+            target->compiler_args.values = calloc(targetFeature->compiler_args_count, sizeof(char*));
+            if (target->compiler_args.values == NULL) {
+                errno = ENOMEM;
+                return -1;
+            }
+            target->compiler_args.count = targetFeature->compiler_args_count;
+        }
+        
+        for (size_t j = 0; j < target->compiler_args.count; j++) {
+            uint32_t argumentLength;
+
+            if (remaining < sizeof(argumentLength)) {
+                errno = EINVAL;
+                return -1;
+            }
+            memcpy(&argumentLength, data, sizeof(argumentLength));
+            data += sizeof(argumentLength);
+            remaining -= sizeof(argumentLength);
+            if (argumentLength > remaining) {
+                errno = EINVAL;
+                return -1;
+            }
+            if (__copy_manifest_string((char**)&target->compiler_args.values[j],
+                data, argumentLength) != 0) {
+                return -1;
+            }
+            data += argumentLength;
+            remaining -= argumentLength;
+        }
+    }
+    return 0;
+}
+
 static int __load_network_metadata(struct VaFs* vafs, struct chef_package_manifest* manifest)
 {
     struct chef_vafs_feature_package_network* header;
     char*                                     data;
     int                                       status;
 
-    status = vafs_feature_query(vafs, &g_networkGuid, (struct VaFsFeatureHeader**)&header);
+    status = vafs_reader_query_feature(vafs, &g_networkGuid, (struct VaFsFeatureHeader**)&header);
     if (status != 0) {
         return 0;
     }
@@ -995,7 +1229,7 @@ static int __load_capabilities_metadata(struct VaFs* vafs, struct chef_package_m
     uint32_t                                       i;
     int                                            status;
 
-    status = vafs_feature_query(vafs, &g_capabilitiesGuid, (struct VaFsFeatureHeader**)&header);
+    status = vafs_reader_query_feature(vafs, &g_capabilitiesGuid, (struct VaFsFeatureHeader**)&header);
     if (status != 0) {
         return 0;
     }
@@ -1123,12 +1357,15 @@ int chef_package_manifest_load_vafs(struct VaFs* vafs, struct chef_package_manif
         status = __load_ingredient_options_metadata(vafs, manifest);
     }
     if (status == 0) {
+        status = __load_toolchain_options_metadata(vafs, manifest);
+    }
+    if (status == 0) {
         status = __load_network_metadata(vafs, manifest);
     }
     if (status == 0) {
         status = __load_capabilities_metadata(vafs, manifest);
     }
-    if (status != 0) {
+    if (status) {
         __free_manifest_contents(manifest);
         free(manifest);
         return status;
@@ -1140,21 +1377,29 @@ int chef_package_manifest_load_vafs(struct VaFs* vafs, struct chef_package_manif
 
 int chef_package_manifest_load(const char* path, struct chef_package_manifest** manifestOut)
 {
-    struct VaFs* vafs;
-    int          status;
+    struct chef_vafs_codec_context* codecContext = NULL;
+    struct VaFs*                    vafs;
+    int                              status;
 
     if (path == NULL || manifestOut == NULL) {
         errno = EINVAL;
         return -1;
     }
 
-    status = vafs_open_file(path, &vafs);
+    status = chef_vafs_codec_context_create(&codecContext);
     if (status != 0) {
         return status;
     }
 
+    status = chef_vafs_reader_open_file(codecContext, path, &vafs);
+    if (status != 0) {
+        chef_vafs_codec_context_destroy(codecContext);
+        return status;
+    }
+
     status = chef_package_manifest_load_vafs(vafs, manifestOut);
-    vafs_close(vafs);
+    vafs_reader_close(vafs);
+    chef_vafs_codec_context_destroy(codecContext);
     return status;
 }
 
@@ -1168,32 +1413,36 @@ int chef_package_manifest_write(struct VaFs* vafs, const struct chef_package_man
     }
 
     status = __write_header_metadata(vafs, manifest);
-    if (status != 0) {
-        return -1;
+    if (status) {
+        return status;
     }
     status = __write_version_metadata(vafs, &manifest->version);
-    if (status != 0) {
-        return -1;
+    if (status) {
+        return status;
     }
     status = __write_icon_metadata(vafs, &manifest->icon);
-    if (status != 0) {
-        return -1;
+    if (status) {
+        return status;
     }
     status = __write_ingredient_options_metadata(vafs, manifest);
-    if (status != 0) {
-        return -1;
+    if (status) {
+        return status;
+    }
+    status = __write_toolchain_options_metadata(vafs, manifest);
+    if (status) {
+        return status;
     }
     status = __write_network_metadata(vafs, manifest);
-    if (status != 0) {
-        return -1;
+    if (status) {
+        return status;
     }
     status = __write_capabilities_metadata(vafs, manifest);
-    if (status != 0) {
-        return -1;
+    if (status) {
+        return status;
     }
     status = __write_commands_metadata(vafs, manifest);
-    if (status != 0) {
-        return -1;
+    if (status) {
+        return status;
     }
     return 0;
 }

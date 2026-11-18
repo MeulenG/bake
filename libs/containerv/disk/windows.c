@@ -29,6 +29,54 @@
 #include <string.h>
 #include <vlog.h>
 
+#ifdef _WIN32
+#include <windows.h>
+#else
+#include <sys/stat.h>
+#endif
+
+static char* __new_local_generation(const char* cache)
+{
+    for (int attempt = 0; attempt < 16; ++attempt) {
+        char  name[39] = "local-";
+        char* path;
+        int   exists;
+
+        if (platform_secure_random_string(name + 6, 32) != 0) {
+            return NULL;
+        }
+
+        path = strpathcombine(cache, name);
+        if (path == NULL) {
+            return NULL;
+        }
+        
+#ifdef _WIN32
+        if (CreateDirectoryA(path, NULL)) {
+            return path;
+        }
+        
+        exists = GetLastError() == ERROR_ALREADY_EXISTS;
+        if (!exists) {
+            errno = EIO;
+        }
+#else
+        if (mkdir(path, 0700) == 0) {
+            return path;
+        }
+        exists = errno == EEXIST;
+#endif
+        free(path);
+        
+        if (!exists) {
+            return NULL;
+        }
+    }
+    
+    errno = EEXIST;
+    return NULL;
+}
+
 /* Derive a stable cache archive name by prefixing the source suffix with a URL hash. */
 static int __build_cached_archive_name(const char* url, uint64_t hash, char* buffer, size_t buffer_size)
 {
@@ -251,29 +299,49 @@ static char* __read_boot_parameters_file(const char* image_path)
     return text;
 }
 
+static int __bundle_has_any_file(const char* image_path, const char* const* candidates)
+{
+    char* detected;
+
+    detected = __find_optional_bundle_file(image_path, candidates);
+    if (detected == NULL) {
+        return 0;
+    }
+
+    free(detected);
+    return 1;
+}
+
 int containerv_disk_validate_lcow_uvm(const char* image_path)
 {
-    char* uvm_vhdx;
-    int   status;
+    static const char* const legacy_disk_candidates[] = { "uvm.vhdx", "uvm.vhd", NULL };
+    static const char* const kernel_candidates[] = { "vmlinux", "kernel", "kernel64", NULL };
+    static const char* const initrd_candidates[] = { "initrd.img", "initrd", NULL };
+    static const char* const rootfs_candidates[] = { "rootfs.vhd", "rootfs.vhdx", NULL };
+    int has_legacy_disk;
+    int has_kernel;
+    int has_initrd;
+    int has_rootfs;
 
     if (!containerv_disk_path_is_directory(image_path)) {
         errno = ENOENT;
         return -1;
     }
 
-    uvm_vhdx = strpathcombine(image_path, "uvm.vhdx");
-    if (uvm_vhdx == NULL) {
-        errno = ENOMEM;
-        return -1;
+    has_legacy_disk = __bundle_has_any_file(image_path, legacy_disk_candidates);
+    if (has_legacy_disk) {
+        return 0;
     }
 
-    status = containerv_disk_path_exists(uvm_vhdx) ? 0 : -1;
-    free(uvm_vhdx);
-    if (status != 0) {
-        errno = ENOENT;
-        return -1;
+    has_kernel = __bundle_has_any_file(image_path, kernel_candidates);
+    has_initrd = __bundle_has_any_file(image_path, initrd_candidates);
+    has_rootfs = __bundle_has_any_file(image_path, rootfs_candidates);
+    if (has_kernel && (has_initrd || has_rootfs)) {
+        return 0;
     }
-    return 0;
+
+    errno = ENOENT;
+    return -1;
 }
 
 int containerv_disk_lcow_detect_uvm_files(
@@ -282,8 +350,8 @@ int containerv_disk_lcow_detect_uvm_files(
     char**      initrd_file_out,
     char**      boot_parameters_out)
 {
-    static const char* const kernel_candidates[] = { "kernel", "kernel64", NULL };
-    static const char* const initrd_candidates[] = { "initrd", "initrd.img", NULL };
+    static const char* const kernel_candidates[] = { "vmlinux", "kernel", "kernel64", NULL };
+    static const char* const initrd_candidates[] = { "initrd.img", "initrd", NULL };
 
     if (kernel_file_out != NULL) {
         *kernel_file_out = NULL;
@@ -323,6 +391,8 @@ int containerv_disk_setup_lcow_uvm(
     char     archiveName[64];
     char*    archivePath = NULL;
     char*    uvmUnpackDirectory = NULL;
+    int      refreshLocalBundle = 0;
+    int      ownsGeneration = 0;
     int      status = -1;
 
     if (uvmImageOut == NULL) {
@@ -351,12 +421,21 @@ int containerv_disk_setup_lcow_uvm(
     }
 
     uvmUrlHash = containerv_disk_fnv1a64(uvmUrl);
+    refreshLocalBundle = strncmp(uvmUrl, "file:", 5) == 0;
     snprintf(uvmCacheKey, sizeof(uvmCacheKey), "%016llx", (unsigned long long)uvmUrlHash);
     if (__build_cached_archive_name(uvmUrl, uvmUrlHash, archiveName, sizeof(archiveName)) != 0) {
         goto cleanup;
     }
 
     VLOG_DEBUG("containerv[lcow]", "resolving LCOW UVM assets from %s\n", uvmUrl);
+    if (refreshLocalBundle) {
+        char* generation = __new_local_generation(uvmDirectory);
+        if (generation == NULL) goto cleanup;
+        free(uvmDirectory);
+        uvmDirectory = generation;
+        ownsGeneration = 1;
+    }
+
     if (containerv_disk_cache_archive(uvmDirectory, archiveName, uvmUrl, &archivePath) != 0) {
         VLOG_ERROR("containerv[lcow]", "failed to cache LCOW UVM assets from %s\n", uvmUrl);
         goto cleanup;
@@ -378,6 +457,12 @@ int containerv_disk_setup_lcow_uvm(
     status = 0;
 
 cleanup:
+    // Only this invocation owns a local generation. Published generations are
+    // retained until the cache is explicitly cleared, never refreshed in place.
+    if (ownsGeneration) {
+        if (archivePath != NULL) (void)platform_unlink(archivePath);
+        if (status != 0) (void)platform_rmdir(uvmDirectory);
+    }
     free(archivePath);
     free(uvmUrl);
     free(uvmDirectory);

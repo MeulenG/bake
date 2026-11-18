@@ -34,11 +34,14 @@
 
 #include "../private.h"
 
+#include "vafs_manager.h"
+
 struct __container {
     struct list_item                 item_header;
     char*                            id;
     struct containerv_container*     handle;
     struct containerv_layer_context* layer_context;  // Layer composition context
+    struct cvd_vafs_layer_instance*  vafs_instance;
     struct list                      processes;
     unsigned int                     next_process_id;
 };
@@ -58,7 +61,10 @@ static void __container_process_delete(void* item)
     free(proc);
 }
 
-static struct __container* __container_new(struct containerv_container* handle, struct containerv_layer_context* layerContext)
+static struct __container* __container_new(
+    struct containerv_container*     handle,
+    struct containerv_layer_context* layerContext,
+    struct cvd_vafs_layer_instance*  vafsInstance)
 {
     struct __container* container = calloc(1, sizeof(struct __container));
     if (container == NULL) {
@@ -71,6 +77,7 @@ static struct __container* __container_new(struct containerv_container* handle, 
     }
     container->handle = handle;
     container->layer_context = layerContext;
+    container->vafs_instance = vafsInstance;
     list_init(&container->processes);
     container->next_process_id = 0;
     return container;
@@ -83,6 +90,7 @@ static void __container_delete(struct __container* container)
     }
 
     list_destroy(&container->processes, __container_process_delete);
+    cvd_vafs_layer_instance_release(container->vafs_instance);
     free(container->id);
     free(container);
 }
@@ -243,6 +251,7 @@ struct containerv_policy* __policy_from_spec(const struct chef_policy_spec* spec
                 __to_policy_plugin(&spec->plugins[i]);
             if (plugin == NULL) {
                 list_destroy(&plugins, __free_policy_plugin);
+                return NULL;
             }
             list_add(&plugins, &plugin->header);
         }
@@ -260,6 +269,7 @@ struct __create_container_params {
     struct containerv_layer*         layers; // cleanup
     int                              layers_count;
     struct containerv_layer_context* layer_context; // cleanup on failures
+    struct cvd_vafs_layer_instance*  vafs_instance; // transferred on success
 };
 
 static void __create_container_params_cleanup(struct __create_container_params* params)
@@ -277,6 +287,16 @@ static enum chef_status __create_linux_container(const struct chef_create_parame
 {
     struct containerv_policy* policy;
     int                       status;
+
+    status = cvd_vafs_mount_manager_prepare_layers(
+        containerParams->layers,
+        containerParams->layers_count,
+        &containerParams->vafs_instance
+    );
+    if (status) {
+        VLOG_ERROR("cvd", "cvd_create: failed to activate VaFS layers\n");
+        return CHEF_STATUS_FAILED_ROOTFS_SETUP;
+    }
 
     status = containerv_layers_compose(
         containerParams->layers,
@@ -340,10 +360,11 @@ static enum chef_status __create_linux_container(const struct chef_create_parame
     }
     return CHEF_STATUS_SUCCESS;
 }
+
 #elif CHEF_ON_WINDOWS
 static int __windows_hcs_has_disallowed_layers(const struct chef_create_parameters* params)
 {
-    if (params == NULL || params->layers == NULL || params->layers_count == 0) {
+    if (params == NULL || params->layers == NULL || params->layers_count == 0 || params->gtype == CHEF_GUEST_TYPE_LINUX) {
         return 0;
     }
 
@@ -370,11 +391,10 @@ static enum chef_status __resolve_lcow_runtime(
     const char**                         initrd_out,
     const char**                         boot_out)
 {
-    struct cvd_config_lcow lcow = { 0 };
-    const char*            uvm_image;
-    const char*            kernel;
-    const char*            initrd;
-    const char*            boot;
+    const char* uvm_image;
+    const char* kernel;
+    const char* initrd;
+    const char* boot;
 
     if (resolved_uvm_image == NULL ||
         resolved_kernel == NULL ||
@@ -391,7 +411,6 @@ static enum chef_status __resolve_lcow_runtime(
     *resolved_kernel = NULL;
     *resolved_initrd = NULL;
     *resolved_boot = NULL;
-    cvd_config_lcow(&lcow);
 
     uvm_image = params->guest_windows.lcow_uvm_image_path;
     kernel = params->guest_windows.lcow_kernel_file;
@@ -399,37 +418,11 @@ static enum chef_status __resolve_lcow_runtime(
     boot = params->guest_windows.lcow_boot_parameters;
 
     if (uvm_image == NULL || uvm_image[0] == '\0') {
-        uvm_image = lcow.uvm_image_path;
-    }
-    if (kernel == NULL || kernel[0] == '\0') {
-        kernel = lcow.kernel_file;
-    }
-    if (initrd == NULL || initrd[0] == '\0') {
-        initrd = lcow.initrd_file;
-    }
-    if (boot == NULL || boot[0] == '\0') {
-        boot = lcow.boot_parameters;
+        return CHEF_STATUS_FAILED_ROOTFS_SETUP;
     }
 
-    if (uvm_image != NULL && uvm_image[0] != '\0' && containerv_disk_validate_lcow_uvm(uvm_image) != 0) {
+    if (containerv_disk_validate_lcow_uvm(uvm_image) != 0) {
         VLOG_ERROR("cvd", "cvd_create: configured LCOW UVM bundle is invalid: %s\n", uvm_image);
-        uvm_image = NULL;
-    }
-
-    if ((uvm_image == NULL || uvm_image[0] == '\0') &&
-        lcow.uvm_url != NULL && lcow.uvm_url[0] != '\0') {
-        struct containerv_disk_lcow_uvm_config cfg = { 0 };
-
-        cfg.uvm_url = lcow.uvm_url;
-        if (containerv_disk_setup_lcow_uvm(&cfg, resolved_uvm_image) != 0) {
-            VLOG_ERROR("cvd", "cvd_create: failed to resolve LCOW UVM assets from %s\n", lcow.uvm_url);
-            return CHEF_STATUS_FAILED_ROOTFS_SETUP;
-        }
-        uvm_image = *resolved_uvm_image;
-    }
-
-    if (uvm_image == NULL || uvm_image[0] == '\0') {
-        VLOG_ERROR("cvd", "cvd_create: LCOW requires a configured UVM image path or UVM URL in cvd.json\n");
         return CHEF_STATUS_FAILED_ROOTFS_SETUP;
     }
 
@@ -584,6 +577,11 @@ static enum chef_status __create_hyperv_container(const struct chef_create_param
             __is_nonempty(params->network.gateway_ip) ? params->network.gateway_ip : NULL,
             __is_nonempty(params->network.dns) ? params->network.dns : NULL
         );
+    } else if (params->gtype == CHEF_GUEST_TYPE_LINUX) {
+        containerv_options_set_network_ex(containerParams->opts, NULL, NULL,
+            __is_nonempty(params->network.host_ip) ? params->network.host_ip : NULL,
+            __is_nonempty(params->network.gateway_ip) ? params->network.gateway_ip : NULL,
+            __is_nonempty(params->network.dns) ? params->network.dns : NULL);
     }
 
     // setup other config
@@ -593,7 +591,8 @@ static enum chef_status __create_hyperv_container(const struct chef_create_param
         CV_CAP_IPC;
 
     // Enable network capability if requested by policy profile or network configuration.
-    if (__spec_contains_plugin(&params->policy, "network") ||
+    if (params->gtype == CHEF_GUEST_TYPE_LINUX ||
+        __spec_contains_plugin(&params->policy, "network") ||
         (__is_nonempty(params->network.container_ip) 
             && __is_nonempty(params->network.container_netmask))) {
         caps |= CV_CAP_NETWORK;
@@ -629,13 +628,16 @@ enum chef_status cvd_create(const struct chef_create_parameters* params, const c
     }
 
     if (params->id == NULL || strlen(params->id) == 0) {
-        platform_secure_random_string(&cvdIDBuffer[0], sizeof(cvdIDBuffer) - 1);
+        if (platform_secure_random_string(&cvdIDBuffer[0], sizeof(cvdIDBuffer) - 1) != 0) {
+            VLOG_ERROR("cvd", "cvd_create: failed to generate container ID\n");
+            return CHEF_STATUS_INTERNAL_ERROR;
+        }
         cvdIDBuffer[sizeof(cvdIDBuffer) - 1] = '\0';
         containerParams.id = &cvdIDBuffer[0];
     } else {
         containerParams.id = params->id;
     }
-    VLOG_TRACE("cvd", "cvd_create: container ID %s\n", containerParams.id);
+    VLOG_DEBUG("cvd", "cvd_create: container ID %s\n", containerParams.id);
 
     containerParams.opts = containerv_options_new();
     if (containerParams.opts == NULL) {
@@ -662,23 +664,31 @@ enum chef_status cvd_create(const struct chef_create_parameters* params, const c
     // this will free all non-essential members of containerParams
     __create_container_params_cleanup(&containerParams);
     if (status != CHEF_STATUS_SUCCESS) {
-        VLOG_ERROR("cvd", "cvd_create: failed to setup & create container\n");
+        VLOG_ERROR("cvd", "cvd_create: failed to setup & create container: %i\n", status);
         if (containerParams.container != NULL) {
             containerv_destroy(containerParams.container);
         }
         containerv_layers_destroy(containerParams.layer_context);
+        cvd_vafs_layer_instance_release(containerParams.vafs_instance);
         return status;
     }
 
-    _container = __container_new(containerParams.container, containerParams.layer_context);
+    _container = __container_new(
+        containerParams.container,
+        containerParams.layer_context,
+        containerParams.vafs_instance
+    );
     if (_container == NULL) {
         VLOG_ERROR("cvd", "failed to allocate memory for the container structure\n");
         if (containerParams.container != NULL) {
             containerv_destroy(containerParams.container);
         }
         containerv_layers_destroy(containerParams.layer_context);
+        cvd_vafs_layer_instance_release(containerParams.vafs_instance);
         return __chef_status_from_errno();
     }
+
+    containerParams.vafs_instance = NULL;
 
     // Store the layer context for cleanup later
     _container->layer_context = containerParams.layer_context;
@@ -690,23 +700,29 @@ enum chef_status cvd_create(const struct chef_create_parameters* params, const c
 
 static int __split_command(const char* line, char** command, char** arguments)
 {
-    char        buffer[1024] = { 0 };
-    const char* p = strchr(line, ' ');
-
-    if (p != NULL) {
-        strncpy(&buffer[0], line, p - line);
-        *command = platform_strdup(&buffer[0]);
-        *arguments = platform_strdup(p + 1);
-        if (*command == NULL || *arguments == NULL) {
-            free(*command);
-            return -1;
-        }
-    } else {
-        *command = platform_strdup(line);
-        if (*command == NULL) {
-            return -1;
-        }
+    char* copy = platform_strdup(line);
+    char** argv;
+    int argc;
+    if (copy == NULL) return -1;
+    argv = strargv(copy, NULL, &argc);
+    if (argv == NULL || argc == 0 || argv[0][0] == '\0') {
+        strargv_free(argv);
+        free(copy);
+        errno = EINVAL;
+        return -1;
+    }
+    // Parse and serialize with the same quoting rules used by containerv.
+    // This also handles quoted executable paths without a fixed-size buffer.
+    *command = platform_strdup(argv[0]);
+    *arguments = strargv_windows((const char* const*)(argv + 1));
+    strargv_free(argv);
+    free(copy);
+    if (*command == NULL || *arguments == NULL) {
+        free(*command);
+        free(*arguments);
+        *command = NULL;
         *arguments = NULL;
+        return -1;
     }
     return 0;
 }
@@ -739,7 +755,7 @@ enum chef_status cvd_spawn(const struct chef_spawn_parameters* params, unsigned 
 {
     struct __container*             container;
     int                             status;
-    unsigned int                    public_id;
+    unsigned int                    publicID;
     process_handle_t                handle = 0;
     char*                           command = NULL;
     char*                           arguments = NULL;
@@ -793,8 +809,8 @@ enum chef_status cvd_spawn(const struct chef_spawn_parameters* params, unsigned 
         goto cleanup;
     }
 
-    public_id = __container_register_process(container, handle);
-    if (public_id == 0) {
+    publicID = __container_register_process(container, handle);
+    if (publicID == 0) {
         VLOG_ERROR("cvd", "cvd_spawn: failed to register process handle\n");
         containerv_kill(container->handle, handle);
         ret = CHEF_STATUS_INTERNAL_ERROR;
@@ -802,7 +818,7 @@ enum chef_status cvd_spawn(const struct chef_spawn_parameters* params, unsigned 
     }
 
     if (pIDOut != NULL) {
-        *pIDOut = public_id;
+        *pIDOut = publicID;
     }
 
 cleanup:
@@ -814,9 +830,9 @@ cleanup:
 
 enum chef_status cvd_kill(const char* containerID, const unsigned int pID)
 {
-    struct __container* container;
+    struct __container*         container;
     struct __container_process* proc;
-    int                 status;
+    int                         status;
     VLOG_DEBUG("cvd", "cvd_kill(id=%s, pid=%u)\n", containerID, pID);
 
     // find container
@@ -906,7 +922,11 @@ enum chef_status cvd_destroy(const char* containerID)
     // Clean up layer context
     if (container->layer_context != NULL) {
         containerv_layers_destroy(container->layer_context);
+        container->layer_context = NULL;
     }
+
+    cvd_vafs_layer_instance_release(container->vafs_instance);
+    container->vafs_instance = NULL;
 
     __container_delete(container);
     return status == 0 ? CHEF_STATUS_SUCCESS : __chef_status_from_errno();

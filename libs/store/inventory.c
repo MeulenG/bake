@@ -353,7 +353,6 @@ int inventory_load(const char* path, struct store_inventory** inventoryOut)
 
     json = json_load_file(filePath, 0, &error);
     if (json == NULL) {
-        VLOG_WARNING("inventory", "inventory_load: failed to load %s (%u)\n", filePath, json_error_code(&error));
         if (json_error_code(&error) != json_error_cannot_open_file) {
             VLOG_ERROR("inventory", "inventory_load: error at line %d, column %d: %s\n", 
                 error.line, error.column, error.text);
@@ -370,7 +369,7 @@ int inventory_load(const char* path, struct store_inventory** inventoryOut)
         VLOG_ERROR("inventory", "inventory_load: failed to parse the inventory, file corrupt??\n");
         return -1;
     }
-    VLOG_TRACE("inventory", "inventory loaded, %i packs available\n", inventory->packs_count);
+    VLOG_DEBUG("inventory", "inventory loaded, %i packs available\n", inventory->packs_count);
 
     // store the base path of the inventory
     inventory->path = platform_strdup(path);
@@ -441,7 +440,7 @@ int inventory_add(struct store_inventory* inventory, const char* packPath, const
 
     // extend the pack array by one
     oldArray = inventory->packs;
-    newArray = malloc(sizeof(struct store_inventory_pack) * (inventory->packs_count + 1));
+    newArray = calloc(inventory->packs_count + 1, sizeof(struct store_inventory_pack));
     if (!newArray) {
         return -1;
     }
@@ -452,21 +451,35 @@ int inventory_add(struct store_inventory* inventory, const char* packPath, const
 
     // now create the new entry
     packEntry = &((struct store_inventory_pack*)newArray)[inventory->packs_count];
-    memset(packEntry, 0, sizeof(struct store_inventory_pack));
-
-    packEntry->path      = platform_strdup(packPath);
+    packEntry->path      = packPath != NULL ? platform_strdup(packPath) : NULL;
     packEntry->publisher = platform_strdup(publisher);
     packEntry->package   = platform_strdup(package);
     packEntry->platform  = platform != NULL ? platform_strdup(platform) : NULL;
-    packEntry->arch      = platform != NULL ? platform_strdup(arch) : NULL;
-    packEntry->channel   = platform_strdup(channel);
+    packEntry->arch      = arch != NULL ? platform_strdup(arch) : NULL;
+    packEntry->channel   = channel != NULL ? platform_strdup(channel) : NULL;
     packEntry->revision  = revision;
+
+    if ((packPath != NULL && packEntry->path == NULL) ||
+        packEntry->publisher == NULL ||
+        packEntry->package == NULL ||
+        (platform != NULL && packEntry->platform == NULL) ||
+        (arch != NULL && packEntry->arch == NULL) ||
+        (channel != NULL && packEntry->channel == NULL)) {
+        free((void*)packEntry->path);
+        free((void*)packEntry->publisher);
+        free((void*)packEntry->package);
+        free((void*)packEntry->platform);
+        free((void*)packEntry->arch);
+        free((void*)packEntry->channel);
+        free(newArray);
+        return -1;
+    }
 
     *packOut = packEntry;
 
     // Update the new array stored before we serialize the inventory to disk.
     inventory->packs = newArray;
-    inventory->packs_count += 1;
+    inventory->packs_count++;
     free(oldArray);
     return 0;
 }

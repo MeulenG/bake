@@ -24,6 +24,7 @@
 
 #include <chef/package_manifest.h>
 #include <chef/platform.h>
+#include <chef/store.h>
 #include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -31,31 +32,17 @@
 
 static sm_event_t __ensure_base(struct served_transaction* transaction, const char* name, const char* baseName)
 {
-    struct state_application* application;
     struct state_application* base;
     unsigned int              transactionId;
     char                      nameBuffer[256];
     char                      descriptionBuffer[512];
-    int                       applicationMissing;
     int                       baseInstalled;
     
     served_state_lock();
-    application = served_state_application(name);
     base = served_state_application(baseName);
-    applicationMissing = (application == NULL);
-    baseInstalled = (base != NULL);
     served_state_unlock();
 
-    if (applicationMissing) {
-        TXLOG_ERROR(
-            transaction,
-            "Package '%s' not found in state while resolving base dependency",
-            name
-        );
-        return SERVED_TX_EVENT_FAILED;
-    }
-
-    if (baseInstalled) {
+    if (base != NULL) {
         TXLOG_INFO(transaction, "Base for %s already installed", name);
         return SERVED_TX_EVENT_OK;
     }
@@ -98,7 +85,7 @@ enum sm_action_result served_handle_state_dependencies(void* context)
     struct state_transaction*  state;
     char*                      packageName = NULL;
     char**                     names = NULL;
-    char*                      path = NULL;
+    const char*                path = NULL;
     char*                      base = NULL;
     struct chef_package_manifest* manifest = NULL;
     sm_event_t                 event = SERVED_TX_EVENT_FAILED;
@@ -128,13 +115,29 @@ enum sm_action_result served_handle_state_dependencies(void* context)
         goto cleanup;
     }
 
-    path = utils_path_pack(names[0], names[1], revision);
-    if (path == NULL) {
-        TXLOG_ERROR(transaction,
-            "Failed to construct package path for '%s/%s'",
-            names[0], names[1]
-        );
-        goto cleanup;
+    if (revision < 0) {
+        path = utils_path_pack(names[0], names[1], revision);
+        if (path == NULL) {
+            TXLOG_ERROR(transaction,
+                "Failed to construct package path for '%s/%s'",
+                names[0], names[1]
+            );
+            goto cleanup;
+        }
+    } else {
+        if (store_package_path(&(struct store_package) {
+                .name = packageName,
+                .platform = CHEF_PLATFORM_STR,
+                .arch = CHEF_ARCHITECTURE_STR,
+                .channel = NULL,
+                .revision = revision
+            }, &path) != 0) {
+            TXLOG_ERROR(transaction,
+                "Failed to find downloaded package '%s/%s' revision %i",
+                names[0], names[1], revision
+            );
+            goto cleanup;
+        }
     }
 
     // Goal: parse the package, figure out which base it uses. We then need to ensure
@@ -145,6 +148,13 @@ enum sm_action_result served_handle_state_dependencies(void* context)
             "Failed to load package %s/%s (%s): %s",
             names[0], names[1], path, strerror(errno)
         );
+        goto cleanup;
+    }
+
+    // If this is an OS base, then skip dependencies.
+    if (manifest->type == CHEF_PACKAGE_TYPE_OSBASE) {
+        TXLOG_INFO(transaction, "Installing an OS base package, skipping dependency checks");
+        event = SERVED_TX_EVENT_OK;
         goto cleanup;
     }
 
@@ -172,7 +182,7 @@ enum sm_action_result served_handle_state_dependencies(void* context)
 
             event = __ensure_base(transaction, packageName, base);
             free(base);
-            if (event == SERVED_TX_EVENT_OK) {
+            if (event == SERVED_TX_EVENT_OK || event == SERVED_TX_EVENT_WAIT) {
                 break;
             }
         }
@@ -187,7 +197,9 @@ cleanup:
     chef_package_manifest_free(manifest);
     strsplit_free(names);
     free(packageName);
-    free(path);
+    if (revision < 0) {
+        free((void*)path);
+    }
     served_sm_post_event(&transaction->sm, event);
     return event == SERVED_TX_EVENT_WAIT ? SM_ACTION_WAIT : SM_ACTION_CONTINUE;
 }

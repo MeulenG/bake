@@ -19,6 +19,7 @@
 #include <ctype.h>
 #include <chef/platform.h>
 #include <chef/recipe.h>
+#include <errno.h>
 #include <stdlib.h>
 #include <string.h>
 #include <vlog.h>
@@ -55,22 +56,29 @@ int recipe_parse_platform_toolchain(const char* toolchain, char** ingredient, ch
     return 0;
 }
 
-const char* recipe_find_platform_toolchain(struct recipe* recipe, const char* platform)
+struct recipe_platform* recipe_find_platform(struct recipe* recipe, const char* platform)
 {
-    struct recipe_platform* p = NULL;
-    struct list_item*       i;
+    struct list_item* i;
+
+    if (recipe == NULL || platform == NULL) {
+        errno = EINVAL;
+        return NULL;
+    }
 
     list_foreach(&recipe->platforms, i) {
         if (strcmp(((struct recipe_platform*)i)->name, platform) == 0) {
-            p = (struct recipe_platform*)i;
-            break;
+            return (struct recipe_platform*)i;
         }
     }
 
-    if (p == NULL) {
-        return NULL;
-    }
-    return p->toolchain;
+    errno = ENOENT;
+    return NULL;
+}
+
+const char* recipe_find_platform_toolchain(struct recipe* recipe, const char* platform)
+{
+    struct recipe_platform* entry = recipe_find_platform(recipe, platform);
+    return entry != NULL ? entry->toolchain : NULL;
 }
 
 static int __add_string_to_list(const char* str, struct list* out)
@@ -198,7 +206,7 @@ int recipe_parse_part_step(const char* str, char** part, char** step)
 static const char* __default_platform_base(const char* platform)
 {
     if (strcmp(platform, "linux") == 0) {
-        return "ubuntu:24";
+        return "ubuntu:26";
     } else if (strcmp(platform, "windows") == 0) {
         return "windows:servercore-ltsc2022";
     } else if (strcmp(platform, "macos") == 0) {

@@ -16,8 +16,10 @@
  * 
  */
 
+#include <chef/environment.h>
 #include <chef/ingredient.h>
 #include <chef/platform.h>
+#include <ctype.h>
 #include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -28,9 +30,9 @@
 
 static struct oven_backend g_backends[] = {
     //  name       configure          build             clean
-    { "autoconf",  configure_main,    NULL,             NULL },
-    { "autotools", configure_main,    NULL,             NULL },
-    { "cmake",     cmake_main,        NULL,             NULL },
+    { "autoconf",  configure_main,    make_build_main,  make_clean_main },
+    { "autotools", configure_main,    make_build_main,  make_clean_main },
+    { "cmake",     cmake_main,        cmake_build_main, cmake_clean_main },
     { "meson",     meson_config_main, meson_build_main, meson_clean_main },
     { "make",      NULL,              make_build_main,  make_clean_main },
     { "ninja",     NULL,              ninja_build_main, ninja_clean_main },
@@ -38,6 +40,9 @@ static struct oven_backend g_backends[] = {
 
 static struct oven_context g_oven = { 0 };
 struct oven_context* __oven_instance() { return &g_oven; }
+
+static int __is_relative_toolchain_path(const char* path);
+static const char* __get_variable(const char* name, void* context);
 
 int oven_initialize(struct oven_initialize_options* parameters)
 {
@@ -96,8 +101,13 @@ static int __ensure_recipe_dirs(struct oven_recipe_options* options)
 
 int oven_recipe_start(struct oven_recipe_options* options)
 {
+    if (options == NULL || options->name == NULL) {
+        VLOG_ERROR("oven", "oven_recipe_start: invalid options\n");
+        errno = EINVAL;
+        return -1;
+    }
     VLOG_DEBUG("oven", "oven_recipe_start(name=%s)\n", options->name);
-
+    
     if (g_oven.recipe.name) {
         VLOG_ERROR("oven", "oven_recipe_start: recipe already started\n");
         errno = ENOSYS;
@@ -112,6 +122,31 @@ int oven_recipe_start(struct oven_recipe_options* options)
     // build the toolchain path
     if (options->toolchain != NULL) {
         g_oven.recipe.toolchain = strpathcombine(g_oven.paths.toolchains_root, options->toolchain);
+        if (g_oven.recipe.toolchain == NULL) {
+            goto error;
+        }
+    }
+    if (g_oven.recipe.toolchain != NULL && options->toolchain_config != NULL &&
+        options->toolchain_config->root != NULL) {
+        if (!__is_relative_toolchain_path(options->toolchain_config->root)) {
+            errno = EINVAL;
+            goto error;
+        }
+        char* root = strpathcombine(g_oven.recipe.toolchain, options->toolchain_config->root);
+        if (root == NULL) {
+            goto error;
+        }
+        free((void*)g_oven.recipe.toolchain);
+        g_oven.recipe.toolchain = root;
+    }
+    g_oven.recipe.toolchain_config = options->toolchain_config;
+    g_oven.recipe.target = options->target;
+    if (g_oven.recipe.target != NULL && g_oven.recipe.target->triple != NULL) {
+        g_oven.recipe.target_triple = chef_preprocess_text(g_oven.recipe.target->triple,
+            __get_variable, NULL);
+        if (g_oven.recipe.target_triple == NULL) {
+            goto error;
+        }
     }
 
     // create directories, last as it uses the global access
@@ -131,6 +166,7 @@ void oven_recipe_end(void)
     VLOG_DEBUG("oven", "oven_recipe_end()\n");
     free((void*)g_oven.recipe.name);
     free((void*)g_oven.recipe.toolchain);
+    free(g_oven.recipe.target_triple);
     free((void*)g_oven.recipe.source_root);
     free((void*)g_oven.recipe.build_root);
     memset(&g_oven.recipe, 0, sizeof(struct oven_recipe_context));
@@ -151,6 +187,7 @@ static const char* __get_variable(const char* name, void* context)
         { "CHEF_HOST_PLATFORM", &hostPlatform },
         { "CHEF_HOST_ARCHITECTURE", &hostArch },
         { "TOOLCHAIN_PREFIX", &g_oven.recipe.toolchain },
+        { "TOOLCHAIN_TARGET_TRIPLE", (const char**)&g_oven.recipe.target_triple },
         { "PROJECT_PATH", &g_oven.paths.project_root },
         { "INSTALL_PREFIX", &g_oven.paths.install_root },
         { "BUILD_INGREDIENTS_PREFIX", &g_oven.paths.build_ingredients_root },
@@ -206,6 +243,7 @@ static void __cleanup_backend_data(struct oven_backend_data* data)
 {
     __cleanup_environment(data->environment);
     free((void*)data->arguments);
+    free((void*)data->paths.source);
 }
 
 static struct chef_keypair_item* __preprocess_keypair(struct chef_keypair_item* original)
@@ -219,26 +257,37 @@ static struct chef_keypair_item* __preprocess_keypair(struct chef_keypair_item* 
 
     keypair->key   = platform_strdup(original->key);
     keypair->value = chef_preprocess_text(original->value, __get_variable, NULL);
+    if (keypair->key == NULL || keypair->value == NULL) {
+        free((void*)keypair->key);
+        free((void*)keypair->value);
+        free(keypair);
+        return NULL;
+    }
     return keypair;
 }
 
 static struct list* __preprocess_keypair_list(struct list* original)
 {
-    struct list*      processed = malloc(sizeof(struct list));
+    struct list*      processed;
     struct list_item* item;
 
+    processed = malloc(sizeof(struct list));
     if (!processed) {
         VLOG_ERROR("oven", "failed to allocate memory environment preprocessor\n");
-        return original;
+        return NULL;
     }
 
     list_init(processed);
+    if (original == NULL) {
+        return processed;
+    }
     list_foreach(original, item) {
         struct chef_keypair_item* keypair          = (struct chef_keypair_item*)item;
         struct chef_keypair_item* processedKeypair = __preprocess_keypair(keypair);
         if (!processedKeypair) {
             VLOG_ERROR("oven", "failed to allocate memory environment preprocessor\n");
-            break;
+            __cleanup_environment(processed);
+            return NULL;
         }
 
         list_add(processed, &processedKeypair->list_header);
@@ -271,13 +320,166 @@ static struct chef_keypair_item* __compose_keypair(const char* key, const char* 
     item->key = platform_strdup(key);
     if (item->key == NULL) {
         free(item);
+        return NULL;
     }
     item->value = platform_strdup(value);
     if (item->value == NULL) {
         free((void*)item->key);
         free(item);
+        return NULL;
     }
     return item;
+}
+
+// Package metadata paths must remain contained within the unpacked toolchain.
+static int __is_relative_toolchain_path(const char* path)
+{
+    const char* component = path;
+    const char* separator;
+
+    if (path == NULL || path[0] == '\0') {
+        return 0;
+    }
+    if (path[0] == '/' || path[0] == '\\' ||
+        (isalpha((unsigned char)path[0]) && path[1] == ':')) {
+        return 0;
+    }
+
+    do {
+        separator = strpbrk(component, "/\\");
+        if ((separator == component && component[0] == '.') ||
+            (separator != NULL && separator - component == 1 && component[0] == '.') ||
+            (separator == NULL && strcmp(component, ".") == 0) ||
+            (separator != NULL && separator - component == 2 && component[0] == '.' && component[1] == '.') ||
+            (separator == NULL && strcmp(component, "..") == 0)) {
+            return 0;
+        }
+        component = separator != NULL ? separator + 1 : NULL;
+    } while (component != NULL && component[0] != '\0');
+    return 1;
+}
+
+static int __add_toolchain_keypair(struct list* environment, const char* key, const char* relative)
+{
+    struct chef_keypair_item* pair;
+    char*                     value;
+
+    if (relative == NULL) {
+        return 0;
+    }
+    if (!__is_relative_toolchain_path(relative)) {
+        errno = EINVAL;
+        return -1;
+    }
+
+    value = strpathcombine(g_oven.recipe.toolchain, relative);
+    if (value == NULL) {
+        return -1;
+    }
+    pair = __compose_keypair(key, value);
+    free(value);
+    if (pair == NULL) {
+        return -1;
+    }
+    list_add(environment, &pair->list_header);
+    return 0;
+}
+
+static int __add_toolchain_compiler_args(
+    struct list*                                      environment,
+    const struct chef_package_manifest_toolchain_target* target)
+{
+    char** values;
+    char* flattened;
+    size_t length;
+
+    if (target == NULL || target->compiler_args.count == 0) {
+        return 0;
+    }
+
+    values = calloc(target->compiler_args.count + 1, sizeof(char*));
+    if (values == NULL) {
+        return -1;
+    }
+    for (size_t i = 0; i < target->compiler_args.count; i++) {
+        values[i] = chef_preprocess_text(target->compiler_args.values[i], __get_variable, NULL);
+        if (values[i] == NULL) {
+            while (i > 0) {
+                free(values[--i]);
+            }
+            free(values);
+            return -1;
+        }
+    }
+
+    flattened = strflatten((const char* const*)values, " ", &length);
+    for (size_t i = 0; i < target->compiler_args.count; i++) {
+        free(values[i]);
+    }
+    free(values);
+    if (flattened == NULL) {
+        return -1;
+    }
+
+    for (const char* key = "TOOLCHAIN_COMPILER_ARGS"; key != NULL;) {
+        struct chef_keypair_item* pair = __compose_keypair(key, flattened);
+        if (pair == NULL) {
+            free(flattened);
+            return -1;
+        }
+        list_add(environment, &pair->list_header);
+        key = strcmp(key, "TOOLCHAIN_COMPILER_ARGS") == 0 ? "CFLAGS" :
+            (strcmp(key, "CFLAGS") == 0 ? "CXXFLAGS" : NULL);
+    }
+    free(flattened);
+    return 0;
+}
+
+static int __add_toolchain_environment(struct list* environment)
+{
+    const struct chef_package_manifest_toolchain_config* toolchain = g_oven.recipe.toolchain_config;
+    const struct chef_package_manifest_toolchain_target* target = g_oven.recipe.target;
+    struct chef_keypair_item* pair;
+
+    // A package may omit the descriptor for compatibility with older packs.
+    if (g_oven.recipe.toolchain == NULL || toolchain == NULL) {
+        return 0;
+    }
+
+    pair = __compose_keypair("TOOLCHAIN_PREFIX", g_oven.recipe.toolchain);
+    if (pair == NULL) {
+        return -1;
+    }
+    list_add(environment, &pair->list_header);
+
+    if (__add_toolchain_keypair(environment, "CC", toolchain->cc) != 0 ||
+        __add_toolchain_keypair(environment, "CXX", toolchain->cxx) != 0 ||
+        __add_toolchain_keypair(environment, "AR", toolchain->ar) != 0 ||
+        __add_toolchain_keypair(environment, "RANLIB", toolchain->ranlib) != 0 ||
+        __add_toolchain_keypair(environment, "STRIP", toolchain->strip) != 0 ||
+        __add_toolchain_keypair(environment, "LLVM_CONFIG", toolchain->llvm_config) != 0 ||
+        __add_toolchain_keypair(environment, "TOOLCHAIN_CMAKE_FILE", toolchain->cmake_file) != 0) {
+        return -1;
+    }
+
+    if (target != NULL) {
+        pair = __compose_keypair("TOOLCHAIN_TARGET", target->name);
+        if (pair == NULL) {
+            return -1;
+        }
+        list_add(environment, &pair->list_header);
+    }
+    if (g_oven.recipe.target_triple != NULL) {
+        pair = __compose_keypair("TOOLCHAIN_TARGET_TRIPLE", g_oven.recipe.target_triple);
+        if (pair == NULL) {
+            return -1;
+        }
+        list_add(environment, &pair->list_header);
+    }
+    if (__add_toolchain_compiler_args(environment, target) != 0) {
+        return -1;
+    }
+    return 0;
 }
 
 static struct chef_keypair_item* __build_ingredients_system_path_keypair(const char* key, const char* systemRoot)
@@ -331,7 +533,12 @@ static int __append_or_update_environ_flags(struct list* environment, const char
     return 0;
 }
 
-static int __initialize_backend_data(struct oven_backend_data* data, const char* profile, struct list* arguments, struct list* environment)
+static int __initialize_backend_data(
+    struct oven_backend_data* data,
+    const char*               stepSources,
+    const char*               profile,
+    struct list*              arguments,
+    struct list*              environment)
 {
     // reset the datastructure
     memset(data, 0, sizeof(struct oven_backend_data));
@@ -339,10 +546,18 @@ static int __initialize_backend_data(struct oven_backend_data* data, const char*
     // setup expected paths
     data->paths.root              = g_oven.paths.project_root;
     data->paths.install           = g_oven.paths.install_root;
-    data->paths.source            = g_oven.recipe.source_root;
     data->paths.build             = g_oven.recipe.build_root;
     data->paths.build_ingredients = g_oven.paths.build_ingredients_root;
     data->paths.project           = g_oven.recipe.source_root;
+
+    // stepSources is a relative offset into the project root where the source
+    // of the current step is. This can sometimes be neccessary when project files are
+    // located in sub-directories.
+    if (stepSources != NULL) {
+        data->paths.source = strpathcombine(g_oven.recipe.source_root, stepSources);
+    } else {
+        data->paths.source = platform_strdup(g_oven.recipe.source_root);
+    }
 
     data->project_name        = g_oven.recipe.name;
     data->profile_name        = profile != NULL ? profile : "Release";
@@ -357,6 +572,20 @@ static int __initialize_backend_data(struct oven_backend_data* data, const char*
     if (!data->environment) {
         __cleanup_backend_data(data);
         return -1;
+    }
+
+    if (g_oven.recipe.toolchain_config != NULL) {
+        struct list* toolchainEnvironment = __preprocess_keypair_list(NULL);
+        // Toolchain defaults are applied first; explicit step values override them.
+        if (toolchainEnvironment == NULL ||
+            __add_toolchain_environment(toolchainEnvironment) != 0 ||
+            environment_update(toolchainEnvironment, data->environment) != 0) {
+            __cleanup_environment(toolchainEnvironment);
+            __cleanup_backend_data(data);
+            return -1;
+        }
+        __cleanup_environment(data->environment);
+        data->environment = toolchainEnvironment;
     }
 
     //if (__append_or_update_environ_flags(data->environment)) {
@@ -390,7 +619,13 @@ int oven_configure(struct oven_generate_options* options)
         return -1;
     }
 
-    status = __initialize_backend_data(&data, options->profile, options->arguments, options->environment);
+    status = __initialize_backend_data(
+        &data,
+        options->source_dir,
+        options->profile,
+        options->arguments,
+        options->environment
+    );
     if (status) {
         return status;
     }
@@ -400,17 +635,61 @@ int oven_configure(struct oven_generate_options* options)
     return status;
 }
 
+static int __should_generate(const char* system, int skipGeneration)
+{
+    int combineSupported;
+
+    combineSupported = !strcmp(system, "cmake") ||
+            !strcmp(system, "autotools") ||
+            !strcmp(system, "autoconf");
+    return combineSupported && !skipGeneration;
+}
+
+static int __inline_generate(struct oven_build_options* options, struct oven_backend* backend)
+{
+    struct oven_backend_data data;
+    struct list*             generateEnvironment;
+    struct list              empty = { 0 };
+    int                      status;
+
+    VLOG_TRACE("oven", "configuring step %s (%s)\n", options->name, options->system);
+    status = __initialize_backend_data(
+        &data,
+        options->source_dir,
+        options->profile,
+        options->generate_arguments != NULL ? options->generate_arguments : &empty,
+        options->environment
+    );
+    if (status) {
+        return status;
+    }
+    generateEnvironment = __preprocess_keypair_list(options->generate_environment);
+    if (generateEnvironment == NULL) {
+        __cleanup_backend_data(&data);
+        return -1;
+    }
+
+    status = environment_update(data.environment, generateEnvironment);
+    __cleanup_environment(generateEnvironment);
+    if (!status) {
+        status = backend->generate(&data, options->system_options);
+    }
+    
+    __cleanup_backend_data(&data);
+    return status;
+}
+
 int oven_build(struct oven_build_options* options)
 {
     struct oven_backend*     backend;
     struct oven_backend_data data;
     int                      status;
-    VLOG_DEBUG("oven", "oven_build(name=%s, system=%s)\n", options->name, options->system);
 
-    if (!options) {
+    if (!options || !options->system) {
         errno = EINVAL;
         return -1;
     }
+    VLOG_DEBUG("oven", "oven_build(name=%s, system=%s)\n", options->name, options->system);
 
     backend = __get_backend(options->system);
     if (backend == NULL || backend->build == NULL) {
@@ -418,11 +697,25 @@ int oven_build(struct oven_build_options* options)
         return -1;
     }
 
-    status = __initialize_backend_data(&data, options->profile, options->arguments, options->environment);
+    if (__should_generate(options->system, options->skip_generate)) {
+        status = __inline_generate(options, backend);
+        if (status) {
+            VLOG_ERROR("oven", "configuration failed for step %s (%s)\n", options->name, options->system);
+            return status;
+        }
+    }
+
+    VLOG_TRACE("oven", "building and installing step %s (%s)\n", options->name, options->system);
+    status = __initialize_backend_data(
+        &data,
+        options->source_dir,
+        options->profile,
+        options->arguments,
+        options->environment
+    );
     if (status) {
         return status;
     }
-    
     status = backend->build(&data, options->system_options);
     __cleanup_backend_data(&data);
     return status;
@@ -447,7 +740,13 @@ int oven_clean(struct oven_clean_options* options)
     }
 
     VLOG_TRACE("oven", "running step %s\n", options->name);
-    status = __initialize_backend_data(&data, options->profile, options->arguments, options->environment);
+    status = __initialize_backend_data(
+        &data,
+        options->source_dir,
+        options->profile,
+        options->arguments,
+        options->environment
+    );
     if (status) {
         return status;
     }

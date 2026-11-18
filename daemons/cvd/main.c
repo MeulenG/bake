@@ -97,7 +97,7 @@ int main(int argc, char** argv)
         fprintf(stderr, "cvd: failed to open log file\n");
         return -1;
     }
-    vlog_add_output(debuglog, 1);
+    vlog_sink_add_text(debuglog, 1);
     vlog_set_output_level(debuglog, VLOG_LEVEL_DEBUG);
 
     printf("log opened at %s\n", debuglogPath);
@@ -108,9 +108,15 @@ int main(int argc, char** argv)
 
     // start up the server
     status = cvd_initialize_server(&config, &g_server);
+    if (status != 0) {
+        VLOG_ERROR("cvd", "failed to initialize server\n");
+        return status;
+    }
 
     // we register protocols
     gracht_server_register_protocol(g_server, &chef_cvd_server_protocol);
+    printf("cvd server ready\n");
+    fflush(stdout);
 
     // use the default server loop
     return gracht_server_main_loop(g_server);

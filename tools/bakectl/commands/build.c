@@ -20,6 +20,8 @@
 #include <liboven.h>
 #include <chef/list.h>
 #include <chef/platform.h>
+#include <chef/store.h>
+#include <chef/toolchain.h>
 #include <ctype.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -47,44 +49,29 @@ static void __cleanup_systems(int sig)
     _Exit(0);
 }
 
-static char* __resolve_toolchain(struct recipe* recipe, const char* toolchain, const char* platform)
-{
-    if (strcmp(toolchain, "platform") == 0) {
-        const char* fullChain = recipe_find_platform_toolchain(recipe, platform);
-        char*       name;
-        char*       channel;
-        char*       version;
-        if (fullChain == NULL) {
-            return NULL;
-        }
-        if (recipe_parse_platform_toolchain(fullChain, &name, &channel, &version)) {
-            return NULL;
-        }
-        free(channel);
-        free(version);
-        return name;
-    }
-    return platform_strdup(toolchain);
-}
-
 static void __initialize_generator_options(struct oven_generate_options* options, struct recipe_step* step)
 {
     options->name           = step->name;
     options->profile        = NULL;
     options->system         = step->system;
     options->system_options = &step->options;
+    options->source_dir     = step->source_dir;
     options->arguments      = &step->arguments;
     options->environment    = &step->env_keypairs;
 }
 
 static void __initialize_build_options(struct oven_build_options* options, struct recipe_step* step)
 {
-    options->name           = step->name;
-    options->profile        = NULL;
-    options->system         = step->system;
-    options->system_options = &step->options;
-    options->arguments      = &step->arguments;
-    options->environment    = &step->env_keypairs;
+    options->name                  = step->name;
+    options->profile               = NULL;
+    options->system                = step->system;
+    options->system_options        = &step->options;
+    options->arguments             = &step->arguments;
+    options->environment           = &step->env_keypairs;
+    options->skip_generate         = step->configure.disabled;
+    options->source_dir            = step->source_dir;
+    options->generate_arguments    = &step->configure.arguments;
+    options->generate_environment  = &step->configure.env_keypairs;
 }
 
 static int __build_step(const char* partName, struct list* steps, const char* stepName)
@@ -141,15 +128,15 @@ static int __build_step(const char* partName, struct list* steps, const char* st
     return 0;
 }
 
-static int __build_part(struct recipe* recipe, const char* partName, const char* stepName, const char* platform)
+static int __build_part(struct __bakelib_context* context, const char* partName, const char* stepName, const char* platform)
 {
     struct list_item* item;
     int               status;
     VLOG_DEBUG("bakectl", "__build_part(part=%s, step=%s, platform=%s)\n", partName, stepName, platform);
 
-    list_foreach(&recipe->parts, item) {
+    list_foreach(&context->recipe->parts, item) {
         struct recipe_part* part = (struct recipe_part*)item;
-        char*               toolchain = NULL;
+        struct chef_toolchain toolchain = { 0 };
 
         // find the correct recipe part
         if (strcmp(part->name, partName)) {
@@ -157,24 +144,28 @@ static int __build_part(struct recipe* recipe, const char* partName, const char*
         }
 
         if (part->toolchain != NULL) {
-            toolchain = __resolve_toolchain(recipe, part->toolchain, platform);
-            if (toolchain == NULL) {
-                VLOG_ERROR("bakectl", "part %s was marked for platform toolchain, but no matching toolchain specified for platform %s\n", part->name, platform);
+            if (chef_toolchain_resolve(context->recipe, part->toolchain, platform,
+                CHEF_PLATFORM_STR, CHEF_ARCHITECTURE_STR,
+                context->build_toolchains_directory, &toolchain) != 0) {
+                VLOG_ERROR("bakectl", "failed to resolve toolchain for part %s and platform %s\n", part->name, platform);
                 return -1;
             }
         }
 
         status = oven_recipe_start(&(struct oven_recipe_options) {
             .name = part->name,
-            .toolchain = toolchain
+            .toolchain = toolchain.package_name,
+            .toolchain_config = toolchain.manifest != NULL ? &toolchain.manifest->toolchain : NULL,
+            .target = toolchain.target
         });
-        free(toolchain);
         if (status) {
+            chef_toolchain_destroy(&toolchain);
             break;
         }
 
         status = __build_step(part->name, &part->steps, stepName);
         oven_recipe_end();
+        chef_toolchain_destroy(&toolchain);
 
         if (status) {
             VLOG_ERROR("bakectl", "__build_part: failed to build recipe %s\n", part->name);
@@ -213,6 +204,16 @@ int build_main(int argc, char** argv, struct __bakelib_context* context, struct 
         return -1;
     }
 
+    status = store_initialize(&(struct store_parameters) {
+        .platform = context->build_platform,
+        .architecture = context->build_architecture,
+        // no backend support here
+    });
+    if (status) {
+        VLOG_ERROR("bakectl", "failed to create initialize store\n");
+        return status;
+    }
+
     status = __initialize_oven_options(&ovenOpts, context);
     if (status) {
         fprintf(stderr, "bakectl: failed to allocate memory for options\n");
@@ -225,7 +226,7 @@ int build_main(int argc, char** argv, struct __bakelib_context* context, struct 
         goto cleanup;
     }
     
-    status = __build_part(context->recipe, options->part, options->step, ovenOpts.target_platform);
+    status = __build_part(context, options->part, options->step, ovenOpts.target_platform);
     if (status) {
         fprintf(stderr, "bakectl: failed to build: %s\n", strerror(errno));
     }
@@ -233,5 +234,6 @@ int build_main(int argc, char** argv, struct __bakelib_context* context, struct 
 
 cleanup:
     __destroy_oven_options(&ovenOpts);
+    store_cleanup();
     return status;
 }

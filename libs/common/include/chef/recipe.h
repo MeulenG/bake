@@ -64,16 +64,25 @@ enum recipe_step_type {
     RECIPE_STEP_TYPE_SCRIPT,
 };
 
+struct recipe_step_configure {
+    int         specified;
+    int         disabled;
+    struct list arguments;
+    struct list env_keypairs;
+};
+
 struct recipe_step {
     struct list_item           list_header;
     const char*                name;
     enum recipe_step_type      type;
     const char*                system;
     const char*                script;
+    const char*                source_dir;
     struct list                depends;
     struct list                arguments;
     struct list                env_keypairs;
     union chef_backend_options options;
+    struct recipe_step_configure configure;
 };
 
 struct recipe_part {
@@ -98,6 +107,7 @@ struct recipe_platform {
     struct list_item list_header;
     const char*      name;
     const char*      base;
+    const char*      target;
     const char*      toolchain;
     struct list      archs;  // list<list_item_string>
 };
@@ -122,6 +132,25 @@ struct recipe_pack_ingredient_options {
     struct list lib_dirs;
     struct list compiler_flags;
     struct list linker_flags;
+};
+
+struct recipe_pack_toolchain_target {
+    struct list_item list_header;
+    const char*      name;
+    const char*      triple;
+    struct list      compiler_args;
+};
+
+struct recipe_pack_toolchain_options {
+    const char* root;
+    const char* cc;
+    const char* cxx;
+    const char* ar;
+    const char* ranlib;
+    const char* strip;
+    const char* llvm_config;
+    const char* cmake_file;
+    struct list targets;
 };
 
 struct recipe_pack_command {
@@ -162,6 +191,7 @@ struct recipe_pack {
     enum chef_package_type                 type;
     struct recipe_pack_application_options app_options;
     struct recipe_pack_ingredient_options  options;
+    struct recipe_pack_toolchain_options   toolchain;
     struct list                            filters;  // list<list_item_string>
     struct list                            commands; // list<recipe_pack_command>
     struct list                            capabilities; // list<recipe_pack_capability>
@@ -222,6 +252,7 @@ extern void recipe_destroy(struct recipe* recipe);
 
 // recipe parser utilities
 extern int         recipe_parse_platform_toolchain(const char* toolchain, char** ingredient, char** channel, char** version);
+extern struct recipe_platform* recipe_find_platform(struct recipe* recipe, const char* platform);
 extern const char* recipe_find_platform_toolchain(struct recipe* recipe, const char* platform);
 extern int         recipe_ensure_target(struct recipe* recipe, const char** expectedPlatform, struct list* expectedArchs);
 extern int         recipe_parse_part_step(const char* str, char** part, char** step);

@@ -219,12 +219,13 @@ static int __resolve_sources(struct __image_context* context, struct chef_image*
             status = chefclient_pack_download(&dlParams, pi.path);
             printf("\n");
 
-            __package_info_free(&pi);
             if (status) {
                 VLOG_ERROR("mkcdk", "__resolve_sources: failed to download %s/%s\n",
                     dlParams.publisher, dlParams.package);
+                __package_info_free(&pi);
                 goto cleanup;
             }
+            __package_info_free(&pi);
             continue;
         }
             
@@ -254,12 +255,13 @@ static int __resolve_sources(struct __image_context* context, struct chef_image*
                 status = chefclient_pack_download(&dlParams, pi.path);
                 printf("\n");
                 
-                __package_info_free(&pi);
                 if (status) {
                     VLOG_ERROR("mkcdk", "__resolve_sources: failed to download %s/%s\n",
                         dlParams.publisher, dlParams.package);
+                    __package_info_free(&pi);
                     goto cleanup;
                 }
+                __package_info_free(&pi);
                 continue;
             }
         }
@@ -288,7 +290,6 @@ static struct ingredient* __open_partition_content(struct __image_context* conte
 {
     struct __package_info pi;
     struct ingredient*    ig = NULL;
-    char*                 path = NULL;
     int                   status;
     VLOG_DEBUG("mkcdk", "__write_image_content(content=%s)\n", content);
 
@@ -304,15 +305,14 @@ static struct ingredient* __open_partition_content(struct __image_context* conte
 
     // If the chef package is of type BOOTLOADER, then we expect certain structure based
     // on the schema.
-    status = ingredient_open(path, &ig);
+    status = ingredient_open(pi.path, &ig);
     if (status) {
-        VLOG_ERROR("mkcdk", "__write_image_content: failed to open ingredient %s\n", path);
+        VLOG_ERROR("mkcdk", "__write_image_content: failed to open ingredient %s\n", pi.path);
         goto cleanup;
     }
 
 cleanup:
     __package_info_free(&pi);
-    free(path);
     return ig;
 }
 
@@ -328,7 +328,6 @@ static int __ensure_directory(struct chef_disk_filesystem* fs, const char* path)
         return 0;
     }
 
-    // ensure that there actually is a directory, and it's not a root directory
     length = strlen(path);
     if (length == 0 || (length == 1 && *path == '/')) {
         return 0;
@@ -340,8 +339,8 @@ static int __ensure_directory(struct chef_disk_filesystem* fs, const char* path)
         return -1;
     }
 
-    if (!strchr(ccpath, '/')) {
-        return 0;
+    while (length > 1 && ccpath[length - 1] == '/') {
+        ccpath[--length] = '\0';
     }
 
     for (p = ccpath + 1; *p; p++) {
@@ -358,7 +357,7 @@ static int __ensure_directory(struct chef_disk_filesystem* fs, const char* path)
             *p = '/';
         }
     }
-    
+
     return fs->create_directory(fs, &(struct chef_disk_fs_create_directory_params) {
         .path = ccpath
     });
@@ -366,11 +365,17 @@ static int __ensure_directory(struct chef_disk_filesystem* fs, const char* path)
 
 static int __ensure_file_directory(struct chef_disk_filesystem* fs, const char* dest)
 {
-    char   tmp[PATH_MAX];
-    char*  p;
+    char  tmp[PATH_MAX];
+    char* p;
+    int   written;
     VLOG_DEBUG("mkcdk", "__ensure_file_directory(dest=%s)\n", dest);
 
-    strcpy(&tmp[0], dest);
+    written = snprintf(&tmp[0], sizeof(tmp), "%s", dest);
+    if (written >= sizeof(tmp)) {
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+    
     p = strrchr(&tmp[0], '/');
     if (p == NULL) {
         VLOG_DEBUG("mkcdk", "__ensure_file_directory: no directory for %s\n", dest);
@@ -416,6 +421,7 @@ static int __write_directory(struct chef_disk_filesystem* fs, const char* source
     int               status;
     VLOG_DEBUG("mkcdk", "__write_directory(source=%s, dest=%s)\n", source, dest);
 
+    list_init(&files);
     status = __ensure_directory(fs, dest);
     if (status) {
         VLOG_ERROR("mkcdk", "__write_directory: failed to create directory for %s\n", dest);
@@ -466,6 +472,7 @@ static int __write_image_content(struct chef_disk_filesystem* fs, const char* co
     int               status;
     VLOG_DEBUG("mkcdk", "__write_image_content()\n");
 
+    list_init(&files);
     status = platform_getfiles(content, 0, &files);
     if (status) {
         VLOG_ERROR("mkcdk", "__write_image_content: failed to read directory %s\n", content);
@@ -501,7 +508,7 @@ static int __write_image_content(struct chef_disk_filesystem* fs, const char* co
     }
 
     platform_getfiles_destroy(&files);
-    return 0;
+    return status;
 }
 
 static int __write_raw(struct chef_disk_filesystem* fs, const char* source, const char* target)
@@ -528,6 +535,12 @@ static int __write_raw(struct chef_disk_filesystem* fs, const char* source, cons
             strsplit_free(options);
             return -1;
         }
+    }
+
+    if (params.offset != 0) {
+        VLOG_ERROR("mkcdk", "__write_raw: offset is not supported\n");
+        strsplit_free(options);
+        return -1;
     }
 
     status = platform_readfile(source, (void**)&params.buffer, &params.size);
@@ -570,6 +583,7 @@ static int __write_image_sources(struct chef_disk_filesystem* fs, struct __image
                     break;
                 }
                 status = __write_file(fs, pinfo.path, src->target);
+                __package_info_free(&pinfo);
                 break;
             case CHEF_IMAGE_SOURCE_RAW:
                 status = __write_raw(fs, src->source, src->target);
@@ -659,14 +673,22 @@ static int __build_image(struct chef_image* image, const char* path, struct __mk
 
         if (strcmp(pi->fstype, "fat32") == 0) {
             fs = chef_filesystem_fat32_new(pd, &(struct chef_disk_filesystem_params) {
-                .sector_size = (unsigned int)options->sector_size
+                .sector_size = (unsigned int)options->sector_size,
+                .options.fat.reserved_image = pi->options.fat.reserved_image
             });
         } else if (strcmp(pi->fstype, "mfs") == 0) {
             fs = chef_filesystem_mfs_new(pd, &(struct chef_disk_filesystem_params) {
-                .sector_size = (unsigned int)options->sector_size
+                .sector_size = (unsigned int)options->sector_size,
+                .options.mfs.reserved_image = pi->options.mfs.reserved_image
             });
         } else {
             VLOG_ERROR("mkcdk", "__build_image: unsupported filesystem: %s\n", pi->fstype);
+            status = -1;
+            goto cleanup;
+        }
+
+        if (fs == NULL) {
+            VLOG_ERROR("mkcdk", "__build_image: failed to create filesystem for %s\n", pi->label);
             status = -1;
             goto cleanup;
         }
@@ -676,14 +698,23 @@ static int __build_image(struct chef_image* image, const char* path, struct __mk
             if (ig == NULL) {
                 VLOG_ERROR("mkcdk", "__build_image: failed to open partition content %s\n", pi->content);
                 status = -1;
+                fs->finish(fs);
                 goto cleanup;
             }
             
-            snprintf(&tmpBuffer[0], sizeof(tmpBuffer) - 1, "%s-content", pi->label);
+            if (snprintf(&tmpBuffer[0], sizeof(tmpBuffer), "%s-content", pi->label) >= sizeof(tmpBuffer)) {
+                VLOG_ERROR("mkcdk", "__build_image: partition label is too long\n");
+                status = -1;
+                ingredient_close(ig);
+                fs->finish(fs);
+                goto cleanup;
+            }
             contentPath = strpathcombine(context.work_directory, &tmpBuffer[0]);
             if (contentPath == NULL) {
                 VLOG_ERROR("mkcdk", "__build_image: failed to allocate memory\n");
                 status = -1;
+                ingredient_close(ig);
+                fs->finish(fs);
                 goto cleanup;
             }
             
@@ -691,6 +722,8 @@ static int __build_image(struct chef_image* image, const char* path, struct __mk
             status = ingredient_unpack(ig, contentPath, NULL, NULL);
             if (status) {
                 VLOG_ERROR("mkcdk", "__build_image: failed to unpack content to %s\n", contentPath);
+                ingredient_close(ig);
+                fs->finish(fs);
                 goto cleanup;
             }
 
@@ -712,6 +745,7 @@ static int __build_image(struct chef_image* image, const char* path, struct __mk
         }
         if (status) {
             VLOG_ERROR("mkcdk", "__build_image: failed to write content for %s\n", pi->label);
+            fs->finish(fs);
             goto cleanup;
         }
 
@@ -786,7 +820,7 @@ int main(int argc, char** argv, char** envp)
 {
     char*                          imagePath = NULL;
     int                            status;
-    int                            logLevel = VLOG_LEVEL_DEBUG;
+    int                            logLevel = VLOG_LEVEL_WARNING;
     struct chef_image*             image = NULL;
     struct __mkcdk_options         options;
     void*                          buffer;

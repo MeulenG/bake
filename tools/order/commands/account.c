@@ -37,7 +37,7 @@ static void __print_help(void)
     printf("  api-key delete <name>  deletes the api-key with the specified id\n");
     printf("  api-key list           lists all api-keys for the current account\n");
     printf("\n  publisher           allows management of publishers for the current account\n");
-    printf("  publisher register <name>              registers a new publisher with the specified name\n");
+    printf("  publisher register                     register a new publisher\n");
     printf("  publisher list                         lists all publishers for the current account\n");
     printf("  publisher get <name> <option>          retrieves information about a specific publisher\n");
     printf("  publisher set <name> <option> <value>  sets the configuration option\n");
@@ -104,7 +104,7 @@ static int __handle_whoami(void)
         printf("\npublishers\n");
         for (int i = 0; i < count; i++) {
             struct chef_publisher* publisher = chef_account_publisher(account, i);
-            printf("  publisher %i: %s (%s)\n", i + 1,
+            printf("  - %s (%s)\n", 
                 chef_publisher_name(publisher),
                 __get_verified_status(publisher)
             );
@@ -115,11 +115,9 @@ static int __handle_whoami(void)
     if (count == 0) {
         printf("  ---- no api-keys registered\n");
     } else {
-        printf("\api-keys\n");
+        printf("api-keys\n");
         for (int i = 0; i < count; i++) {
-            printf("  key %i: %s \n", i + 1,
-                chef_account_apikey_name(account, i)
-            );
+            printf("  - %s\n", chef_account_apikey_name(account, i));
         }
     }
 
@@ -246,9 +244,7 @@ static int __handle_api_key(const char* option, const char* name)
         } else {
             printf("api-keys\n");
             for (int i = 0; i < count; i++) {
-                printf("  key %i: %s\n", i + 1,
-                    chef_account_apikey_name(account, i)
-                );
+                printf("  - %s\n", chef_account_apikey_name(account, i));
             }
         }
     } else {
@@ -284,7 +280,7 @@ static int __handle_publisher_option(const char* option)
             printf("publishers\n");
             for (int i = 0; i < count; i++) {
                 struct chef_publisher* publisher = chef_account_publisher(account, i);
-                printf("  publisher %i: %s (%s)\n", i + 1,
+                printf("  - %s (%s)\n",
                     chef_publisher_name(publisher),
                     __get_verified_status(publisher)
                 );

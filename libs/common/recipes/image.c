@@ -19,6 +19,8 @@
 #include <ctype.h>
 #include <chef/platform.h>
 #include <chef/image.h>
+#include <errno.h>
+#include <limits.h>
 #include <yaml/yaml.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -46,6 +48,9 @@ enum state {
 
     STATE_PARTITION_FAT_OPTIONS,
     STATE_PARTITION_FAT_OPTIONS_RESERVED_IMAGE,
+
+    STATE_PARTITION_MFS_OPTIONS,
+    STATE_PARTITION_MFS_OPTIONS_RESERVED_IMAGE,
 
     STATE_PARTITION_SOURCE,    // MAPPING_START
     STATE_PARTITION_SOURCE_TYPE,
@@ -82,12 +87,65 @@ static const char* __parse_string(const char* value)
     return platform_strdup(value);
 }
 
-static long long __parse_integer(const char* value)
+static long long __parse_quantity(const char* value)
 {
+    char*              end;
+    unsigned long long multiplier = 1;
+    unsigned long long parsed;
+
     if (value == NULL || strlen(value) == 0) {
         return 0;
     }
-    return strtoll(value, NULL, 10);
+
+    if (*value == '-') {
+        return 0;
+    }
+
+    errno = 0;
+    parsed = strtoull(value, &end, 10);
+    if (errno != 0 || end == value) {
+        return 0;
+    }
+
+    while (isspace((unsigned char)*end)) {
+        end++;
+    }
+
+    if (*end != '\0') {
+        char suffix[3] = { 0 };
+
+        suffix[0] = (char)toupper((unsigned char)end[0]);
+        suffix[1] = (char)toupper((unsigned char)end[1]);
+        if (strcmp(suffix, "KB") == 0) {
+            multiplier = 1024ULL;
+            end += 2;
+        } else if (strcmp(suffix, "MB") == 0) {
+            multiplier = 1024ULL * 1024ULL;
+            end += 2;
+        } else if (strcmp(suffix, "GB") == 0) {
+            multiplier = 1024ULL * 1024ULL * 1024ULL;
+            end += 2;
+        } else if (strcmp(suffix, "TB") == 0) {
+            multiplier = 1024ULL * 1024ULL * 1024ULL * 1024ULL;
+            end += 2;
+        } else if (suffix[0] == 'B') {
+            end++;
+        } else {
+            return 0;
+        }
+
+        while (isspace((unsigned char)*end)) {
+            end++;
+        }
+        if (*end != '\0') {
+            return 0;
+        }
+    }
+
+    if (parsed > ((unsigned long long)LLONG_MAX / multiplier)) {
+        return 0;
+    }
+    return (long long)(parsed * multiplier);
 }
 
 static enum chef_image_source_type __parse_source_type(const char* value)
@@ -426,6 +484,8 @@ static int __consume_event(struct parser_state* s, yaml_event_t* event)
                         __parser_push_state(s, STATE_PARTITION_ATTRIBUTES_LIST);
                     } else if (strcmp(value, "fat-options") == 0) {
                         __parser_push_state(s, STATE_PARTITION_FAT_OPTIONS);
+                    } else if (strcmp(value, "mfs-options") == 0) {
+                        __parser_push_state(s, STATE_PARTITION_MFS_OPTIONS);
                     } else if (strcmp(value, "sources") == 0) {
                         __parser_push_state(s, STATE_PARTITION_SOURCES_LIST);
                     } else {
@@ -457,7 +517,7 @@ static int __consume_event(struct parser_state* s, yaml_event_t* event)
         
         __consume_scalar_fn(STATE_PARTITION_LABEL, partition.label, __parse_string)
         __consume_scalar_fn(STATE_PARTITION_TYPE, partition.fstype, __parse_string)
-        __consume_scalar_fn(STATE_PARTITION_SIZE, partition.size, __parse_integer)
+        __consume_scalar_fn(STATE_PARTITION_SIZE, partition.size, __parse_quantity)
         __consume_scalar_fn(STATE_PARTITION_CONTENT, partition.content, __parse_string)
 
         __consume_sequence_unmapped(STATE_PARTITION_ATTRIBUTES_LIST, __add_partitions_attributes)
@@ -487,6 +547,31 @@ static int __consume_event(struct parser_state* s, yaml_event_t* event)
             break;
         
         __consume_scalar_fn(STATE_PARTITION_FAT_OPTIONS_RESERVED_IMAGE, partition.options.fat.reserved_image, __parse_string)
+
+        case STATE_PARTITION_MFS_OPTIONS:
+            switch (event->type) {
+                case YAML_MAPPING_START_EVENT:
+                    break;
+                case YAML_MAPPING_END_EVENT:
+                    __parser_pop_state(s);
+                    break;
+                
+                case YAML_SCALAR_EVENT:
+                    value = (char *)event->data.scalar.value;
+                    if (strcmp(value, "reserved-image") == 0) {
+                        __parser_push_state(s, STATE_PARTITION_MFS_OPTIONS_RESERVED_IMAGE);
+                    } else {
+                        fprintf(stderr, "__consume_event: (STATE_PARTITION_MFS_OPTIONS) unexpected scalar: %s.\n", value);
+                        return -1;
+                    }
+                    break;
+                default:
+                    fprintf(stderr, "__consume_event: unexpected event %d in state %d.\n", event->type, s->state);
+                    return -1;
+            }
+            break;
+        
+        __consume_scalar_fn(STATE_PARTITION_MFS_OPTIONS_RESERVED_IMAGE, partition.options.mfs.reserved_image, __parse_string)
 
         case STATE_PARTITION_SOURCE:
             switch (event->type) {
@@ -591,11 +676,20 @@ static void __destroy_fat(struct chef_image_partition_fat_options* fatOptions)
     free((void*)fatOptions->reserved_image);
 }
 
+static void __destroy_mfs(struct chef_image_partition_mfs_options* mfsOptions)
+{
+    free((void*)mfsOptions->reserved_image);
+}
+
 static void __destroy_partition(struct chef_image_partition* partition)
 {
     // cleanup fs specific options
-    if (partition->fstype != NULL && (strncmp(partition->fstype, "fat", 3) == 0)) {
-        __destroy_fat(&partition->options.fat);
+    if (partition->fstype != NULL) {
+        if (strncmp(partition->fstype, "fat", 3) == 0) {
+            __destroy_fat(&partition->options.fat);
+        } else if (strncmp(partition->fstype, "mfs", 3) == 0) {
+            __destroy_mfs(&partition->options.mfs);
+        }
     }
 
     __destroy_list(string, partition->attributes.head, struct list_item_string);

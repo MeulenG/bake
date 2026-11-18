@@ -1,21 +1,17 @@
-project:
-  name: lcow-uvm
-  summary: LCOW utility VM assets
-  description: |
-    Builds an LCOW UVM bundle (uvm.vhdx + optional kernel/initrd/boot params)
-    using hcsshim + LinuxKit as an offline asset-production step. The
-    normalized output is suitable for `mkuvm`,
-    `cvctl uvm import`, `cvctl uvm import-pack`, and future package-based delivery.
-  author: Philip Meulengracht
-  email: the_meulengracht@hotmail.com
-  version: 1.0.0
-  license: MIT
+name: lcow-uvm
+author: Philip Meulengracht
+email: the_meulengracht@hotmail.com
+version: 1.0.0
+license: MIT
 
 environment:
   host:
     packages:
-      - git
-      - linuxkit
+      - ca-certificates
+      - cpio
+      - gzip
+      - tar
+      - wget
 
 recipes:
   - name: uvm
@@ -24,11 +20,24 @@ recipes:
       path: ./
       script: |
         if build.subsystem.platform_host() == "linux" then
+          if os.getenv("LCOW_BASE_ARCHIVE") == nil or os.getenv("LCOW_KERNEL_PATH") == nil then
+            error("LCOW_BASE_ARCHIVE and LCOW_KERNEL_PATH must be set for the explicit LCOW UVM construct flow")
+          end
           args = build.paths.install()
           args = args .. " " .. build.subsystem.arch_target()
+          build.shell("construct.sh", args)
           build.shell("construct-lcow-uvm.sh", args)
         end
 
 packs:
 - name: lcow-uvm
+  summary: LCOW runtime base
+  description: |
+    Builds a self-contained LCOW runtime base package for Windows-hosted Linux
+    containers. The pack contains:
+    - a Linux guest rootfs under `rootfs/`
+    - an LCOW UVM bundle at the package root (legacy `uvm.vhdx` or modern kernel + initrd/rootfs boot files)
+  
+    This layout lets served/cvd resolve both the guest rootfs and the HvRuntime
+    UVM settings from a single base package.
   type: os

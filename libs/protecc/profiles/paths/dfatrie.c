@@ -283,11 +283,16 @@ static int __dfa_builder_state_setup(struct __dfa_builder_state* state, size_t w
 
 static void __dfa_builder_state_cleanup(struct __dfa_builder_state* state, protecc_error_t err)
 {
+    free(state->state_sets);
+    free(state->scratch_set);
     free(state->next_sibling);
     free(state->node_depths);
     free(state->nodes);
 
     if (err != PROTECC_OK) {
+        // transitions are passed on to the profile
+        // meaning if everything went okay then we do
+        // not own this anymore
         free(state->transitions);
     }
 }
@@ -468,9 +473,10 @@ protecc_error_t protecc_profile_setup_dfa(protecc_profile_t* profile)
     }
 
     while (queueIndex < state.state_count) {
-        const uint64_t* current = state.state_sets + (queueIndex * wordsPerState);
-
         for (uint32_t c = 0; c < PROTECC_PROFILE_DFA_CLASSMAP_SIZE; c++) {
+            // state.state_sets may be realloc'd by __dfa_builder_state_add_transition
+            // below, so this must be re-read fresh every iteration, not hoisted.
+            const uint64_t* current = state.state_sets + (queueIndex * wordsPerState);
             memset(state.scratch_set, 0, wordsPerState * sizeof(uint64_t));
 
             for (size_t n = 0; n < state.node_count; n++) {

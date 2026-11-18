@@ -125,6 +125,7 @@ static char* __container_create_runtime_dir(void)
 static struct containerv_container* __container_new(const char* containerId)
 {
     struct containerv_container* container;
+    char*                        clientSocketsDir = NULL;
 
     container = calloc(1, sizeof(struct containerv_container));
     if (container == NULL) {
@@ -151,7 +152,43 @@ static struct containerv_container* __container_new(const char* containerId)
             return NULL;
         }
     }
-    
+
+    // The runtime directory permissions should be set to 766
+    // so that only the owner and group can access it. This is important 
+    // for security, as the socket is used for communication between the container and the host.
+    if (platform_chmod(container->runtime_dir, S_IRWXU | S_IRGRP | S_IXGRP | S_IROTH | S_IXOTH)) {
+        VLOG_ERROR("containerv", "__container_new: failed to set permissions on runtime dir %s\n", container->runtime_dir);
+        free(container->runtime_dir);
+        free(container);
+        return NULL;
+    }
+
+    // The client socket dir is to allow clients to create their own 
+    // sockets for communication with the container. This allows multiple clients to 
+    // connect to the same container without interfering with each other.
+    clientSocketsDir = strpathcombine(container->runtime_dir, "clients");
+    if (clientSocketsDir == NULL) {
+        free(container->runtime_dir);
+        free(container);
+        return NULL;
+    }
+    if (platform_mkdir(clientSocketsDir)) {
+        VLOG_ERROR("containerv", "__container_new: failed to create client socket dir %s\n", clientSocketsDir);
+        free(clientSocketsDir);
+        free(container->runtime_dir);
+        free(container);
+        return NULL;
+    }
+    // The runtime clients directory permissions should be set to 766
+    if (platform_chmod(clientSocketsDir, S_IRWXU | S_IRGRP | S_IXGRP | S_IROTH | S_IXOTH)) {
+        VLOG_ERROR("containerv", "__container_new: failed to set permissions on client socket dir %s\n", clientSocketsDir);
+        free(clientSocketsDir);
+        free(container->runtime_dir);
+        free(container);
+        return NULL;
+    }
+    free(clientSocketsDir);
+
     // get last part of directory path, the last token is the id
     container->id = strrchr(container->runtime_dir, CHEF_PATH_SEPARATOR) + 1;
 
@@ -249,9 +286,9 @@ static int __wait_for_container_event(int fds[2], struct containerv_event* event
 
 static void __print(const char* line, int error) {
     if (error) {
-        VLOG_ERROR("containerv[child]", line);
+        VLOG_ERROR("containerv[child]", "%s", line);
     } else {
-        VLOG_TRACE("containerv[child]", line);
+        VLOG_TRACE("containerv[child]", "%s", line);
     }
 }
 
@@ -374,6 +411,16 @@ int __containerv_spawn(struct containerv_container* container, struct __containe
         if (proc) {
             list_remove(&container->processes, &proc->list_header);
             containerv_container_process_delete(proc);
+        }
+
+        // A syscall-level wait succeeding says nothing about whether the
+        // spawned process itself actually ran successfully - surface a
+        // non-zero exit code (e.g. immediate exec/loader failure) as a
+        // spawn failure so callers relying on CV_SPAWN_WAIT don't treat a
+        // crashed process as a successful one.
+        if (exit_code != 0) {
+            VLOG_ERROR("containerv[child]", "__containerv_spawn: %s exited with code %d\n", options->path, exit_code);
+            return -1;
         }
     }
 
@@ -705,10 +752,6 @@ static int __container_run(
         flags |= CLONE_NEWNET;
     }
 
-    if (options->capabilities & CV_CAP_PROCESS_CONTROL) {
-        flags |= CLONE_NEWPID;
-    }
-
     if (options->capabilities & CV_CAP_IPC) {
         flags |= CLONE_NEWIPC;
     }
@@ -946,6 +989,19 @@ static int __container_run(
         }
     } else {
         VLOG_DEBUG("containerv[child]", "__container_run: no security policy configured\n");
+    }
+
+    // Unshare the pid namespace last, right before dropping capabilities: the
+    // calling task never joins pid_ns_for_children itself (only its next fork
+    // does), so deferring this keeps that fork - containerv_set_init_process()'s -
+    // as the only one that can claim PID 1, and lets earlier setup (layer
+    // mounting, pthread_create for the VaFS FUSE worker, etc.) run unaffected.
+    if (options->capabilities & CV_CAP_PROCESS_CONTROL) {
+        status = unshare(CLONE_NEWPID);
+        if (status) {
+            VLOG_ERROR("containerv[child]", "__container_run: failed to unshare the pid namespace\n");
+            return status;
+        }
     }
 
     // Drop capabilities that we no longer need
@@ -1466,24 +1522,22 @@ int containerv_join(
     int                              status = -1;
     int                              count;
 
-    VLOG_DEBUG("containerv[host]", "connecting to %s\n", containerId);
     client = containerv_socket_client_open(containerId);
     if (client == NULL) {
-        VLOG_ERROR("containerv[host]", "containerv_join: failed to connect to server\n");
+        fprintf(stderr, "containerv_join: failed to connect to server\n");
         return status;
     }
 
-    VLOG_DEBUG("containerv[host]", "reading container configuration\n");
     status = containerv_socket_client_get_root(client, &chrPath[0], PATH_MAX);
     if (status) {
-        VLOG_ERROR("containerv[host]", "containerv_join: failed to read container configuration\n");
+        fprintf(stderr, "containerv_join: failed to read container configuration\n");
         containerv_socket_client_close(client);
         return status;
     }
 
     status = containerv_socket_client_get_nss(client, fds, &count);
     if (status) {
-        VLOG_ERROR("containerv[host]", "containerv_join: failed to read namespace sockets from container\n");
+        fprintf(stderr, "containerv_join: failed to read namespace sockets from container\n");
         containerv_socket_client_close(client);
         return status;
     }
@@ -1494,49 +1548,45 @@ int containerv_join(
     // any paths before
     status = chdir(&chrPath[0]);
     if (status) {
-        VLOG_ERROR("containerv[host]", "containerv_join: failed to change directory to the chroot\n");
+        fprintf(stderr, "containerv_join: failed to change directory to the chroot\n");
         return status;
     }
 
-    VLOG_DEBUG("containerv[host]", "preparing environment\n");
     for (int i = 0; i < count; i++) {
         if (setns(fds[i].fd, 0))  {
-            VLOG_WARNING("containerv[host]", "containerv_join: failed to join container namespace %i of type %i\n",
+            fprintf(stderr, "containerv_join: failed to join container namespace %i of type %i\n",
                 fds[i].fd, fds[i].type);
         }
     }
 
-    VLOG_DEBUG("containerv[host]", "joining container\n");
     status = chroot(&chrPath[0]);
     if (status) {
-        VLOG_ERROR("containerv[host]", "containerv_join: failed to chroot into container root %s\n", &chrPath[0]);
+        fprintf(stderr, "containerv_join: failed to chroot into container root %s\n", &chrPath[0]);
         return status;
     }
 
     // after chroot, we want to change to the root
     status = chdir("/");
     if (status) {
-        VLOG_ERROR("containerv[host]", "containerv_join: failed to change directory to root\n");
+        fprintf(stderr, "containerv_join: failed to change directory to root\n");
         return status;
     }
 
-    VLOG_DEBUG("containerv[host]", "dropping capabilities\n");
     status = containerv_drop_capabilities();
     if (status) {
-        VLOG_ERROR("containerv[child]", "containerv_join: failed to drop capabilities\n");
+        fprintf(stderr, "containerv_join: failed to drop capabilities\n");
         return status;
     }
-    VLOG_DEBUG("containerv[child]", "successfully joined container\n");
 
     status = chdir(options->cwd);
     if (status) {
-        VLOG_ERROR("containerv[child]", "containerv_join: failed to change directory to %s\n", options->cwd);
+        fprintf(stderr, "containerv_join: failed to change directory to %s\n", options->cwd);
         return status;
     }
 
     status = execve(commandPath, (char* const*)options->argv, (char* const*)options->envp);
     if (status) {
-        VLOG_ERROR("containerv[child]", "containerv_join: failed to execute %s\n", commandPath);
+        fprintf(stderr, "containerv_join: failed to execute %s\n", commandPath);
     }
     return 0;
 }

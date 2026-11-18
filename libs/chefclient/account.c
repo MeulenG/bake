@@ -271,12 +271,28 @@ static json_t* __serialize_account(struct chef_account* account)
     return json;
 }
 
+static char* __safe_member_string_parse_expected(json_t* root, const char* object, const char* key)
+{
+    json_t*     member = json_object_get(root, key);
+    const char* value;
+    if (member == NULL) {
+        VLOG_WARNING("chef-client", "%s: missing expected member '%s'\n", object, key);
+        return NULL;
+    }
+    value = json_string_value(member);
+    if (value == NULL) {
+        VLOG_WARNING("chef-client", "%s: expected member '%s' to be a string\n", object, key);
+        return NULL;
+    }
+    return platform_strdup(value);
+}
+
 static void __parse_publisher(json_t* root, struct chef_publisher* publisher)
 {
-    publisher->name = platform_strdup(json_string_value(json_object_get(root, "name")));
-    publisher->email = platform_strdup(json_string_value(json_object_get(root, "email")));
-    publisher->public_key = platform_strdup(json_string_value(json_object_get(root, "public-key")));
-    publisher->signed_key = platform_strdup(json_string_value(json_object_get(root, "signed-key")));
+    publisher->name = __safe_member_string_parse_expected(root, "publisher", "name");
+    publisher->email = __safe_member_string_parse_expected(root, "publisher", "email");
+    publisher->public_key = __safe_member_string_parse_expected(root, "publisher", "public-key");
+    publisher->signed_key = __safe_member_string_parse_expected(root, "publisher", "signature");
     publisher->verified_status = (enum chef_account_verified_status)json_integer_value(json_object_get(root, "status"));
 }
 
@@ -300,15 +316,8 @@ static int __parse_account(const char* response, struct chef_account** accountOu
     }
 
     // parse the account
-    member = json_object_get(root, "name");
-    if (member) {
-        account->name = platform_strdup(json_string_value(member));
-    }
-
-    member = json_object_get(root, "email");
-    if (member) {
-        account->email = platform_strdup(json_string_value(member));
-    }
+    account->name = __safe_member_string_parse_expected(root, "account", "name");
+    account->email = __safe_member_string_parse_expected(root, "account", "email");
 
     member = json_object_get(root, "status");
     if (member) {
@@ -347,7 +356,7 @@ static int __parse_account(const char* response, struct chef_account** accountOu
 
         for (size_t i = 0; i < count; i++) {
             json_t* key = json_array_get(member, i);
-            account->api_keys[i].name = platform_strdup(json_string_value(json_object_get(key, "name")));
+            account->api_keys[i].name = __safe_member_string_parse_expected(key, "api-key", "name");
         }
     }
 
@@ -439,6 +448,12 @@ static int __update_account(json_t* json, struct chef_account** accountOut)
     code = curl_easy_setopt(request->curl, CURLOPT_POSTFIELDS, body);
     if (code != CURLE_OK) {
         VLOG_ERROR("chef-client", "__update_account: failed to set body [%s]\n", request->error);
+        goto cleanup;
+    }
+
+    code = chef_request_set_content_type(request, "application/json");
+    if (code != CURLE_OK) {
+        VLOG_ERROR("chef-client", "__update_account: failed to set content type [%s]\n", request->error);
         goto cleanup;
     }
 
@@ -637,6 +652,12 @@ int chef_account_publisher_register(const char* name, const char* email)
         goto cleanup;
     }
 
+    code = chef_request_set_content_type(request, "application/json");
+    if (code != CURLE_OK) {
+        VLOG_ERROR("chef-client", "chef_account_publisher_register: failed to set content type [%s]\n", request->error);
+        goto cleanup;
+    }
+
     code = chef_request_execute(request);
     if (code != CURLE_OK) {
         VLOG_ERROR("chef-client", "chef_account_publisher_register: chef_request_execute() failed: %s\n", curl_easy_strerror(code));
@@ -696,19 +717,19 @@ int chef_account_apikey_create(const char* name, char** apiKey)
 
     request = chef_request_new(CHEF_CLIENT_API_SECURE, 1);
     if (!request) {
-        VLOG_ERROR("chef-client", "chef_account_publisher_register: failed to create request\n");
+        VLOG_ERROR("chef-client", "chef_account_apikey_create: failed to create request\n");
         return -1;
     }
 
     // set the url
     if (__get_account_apikeys_url(buffer, sizeof(buffer)) != 0) {
-        VLOG_ERROR("chef-client", "chef_account_publisher_register: buffer too small for account link\n");
+        VLOG_ERROR("chef-client", "chef_account_apikey_create: buffer too small for account link\n");
         goto cleanup;
     }
 
     code = curl_easy_setopt(request->curl, CURLOPT_URL, &buffer[0]);
     if (code != CURLE_OK) {
-        VLOG_ERROR("chef-client", "chef_account_publisher_register: failed to set url [%s]\n", request->error);
+        VLOG_ERROR("chef-client", "chef_account_apikey_create: failed to set url [%s]\n", request->error);
         goto cleanup;
     }
 
@@ -722,13 +743,19 @@ int chef_account_apikey_create(const char* name, char** apiKey)
 
     code = curl_easy_setopt(request->curl, CURLOPT_POSTFIELDS, body);
     if (code != CURLE_OK) {
-        VLOG_ERROR("chef-client", "chef_account_publisher_register: failed to set body [%s]\n", request->error);
+        VLOG_ERROR("chef-client", "chef_account_apikey_create: failed to set body [%s]\n", request->error);
+        goto cleanup;
+    }
+
+    code = chef_request_set_content_type(request, "application/json");
+    if (code != CURLE_OK) {
+        VLOG_ERROR("chef-client", "chef_account_apikey_create: failed to set content type [%s]\n", request->error);
         goto cleanup;
     }
 
     code = chef_request_execute(request);
     if (code != CURLE_OK) {
-        VLOG_ERROR("chef-client", "chef_account_publisher_register: chef_request_execute() failed: %s\n", curl_easy_strerror(code));
+        VLOG_ERROR("chef-client", "chef_account_apikey_create: chef_request_execute() failed: %s\n", curl_easy_strerror(code));
     }
 
     curl_easy_getinfo(request->curl, CURLINFO_RESPONSE_CODE, &httpCode);
@@ -737,7 +764,7 @@ int chef_account_apikey_create(const char* name, char** apiKey)
         if (httpCode == 401) {
             status = -EACCES;
         } else {
-            VLOG_ERROR("chef-client", "chef_account_publisher_register: http error %ld [%s]\n", httpCode, request->response);
+            VLOG_ERROR("chef-client", "chef_account_apikey_create: http error %ld [%s]\n", httpCode, request->response);
             status = -EIO;
         }
         goto cleanup;
@@ -790,6 +817,12 @@ int chef_account_apikey_delete(const char* name)
     code = curl_easy_setopt(request->curl, CURLOPT_CUSTOMREQUEST, "DELETE");
     if (code != CURLE_OK) {
         VLOG_ERROR("chef-client", "chef_account_apikey_delete: failed to set delete option [%s]\n", request->error);
+        goto cleanup;
+    }
+
+    code = chef_request_set_content_type(request, "application/json");
+    if (code != CURLE_OK) {
+        VLOG_ERROR("chef-client", "chef_account_apikey_delete: failed to set content type [%s]\n", request->error);
         goto cleanup;
     }
 

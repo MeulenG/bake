@@ -27,7 +27,7 @@
 enum containerv_layer_type {
     /** Base rootfs layer (debootstrap, image, or path) */
     CONTAINERV_LAYER_BASE_ROOTFS,
-    /** VaFS package layer (.pack file) */
+    /** VaFS package layer (.pack file); Windows only, Linux activates these in cvd */
     CONTAINERV_LAYER_VAFS_PACKAGE,
     /** Host directory bind mount */
     CONTAINERV_LAYER_HOST_DIRECTORY,
@@ -43,7 +43,7 @@ struct containerv_layer {
     
     /** Source path - interpretation depends on type:
      *  - BASE_ROOTFS: path to rootfs directory
-     *  - VAFS_PACKAGE: path to .pack file
+     *  - VAFS_PACKAGE: path to .pack file (Windows only)
      *  - HOST_DIRECTORY: host path to bind
      *  - OVERLAY: working directory path (or NULL for auto)
      */
@@ -72,6 +72,11 @@ struct containerv_layers_compose_options {
      */
     const char* const* windows_wcow_parent_layers;
     int                windows_wcow_parent_layer_count;
+
+    /**
+     * Windows: non-zero when composing an LCOW guest rootfs rather than WCOW.
+     */
+    int                windows_is_lcow;
 };
 
 typedef int (*containerv_layers_iterate_cb)(

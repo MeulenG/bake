@@ -17,6 +17,7 @@
  */
 
 #include <chef/config.h>
+#include <chef/dirs.h>
 #include <chef/platform.h>
 #include <jansson.h>
 #include <stdlib.h>
@@ -141,7 +142,7 @@ static int __parse_config(struct chef_config* config)
     return 0;
 }
 
-static int __initialize_config(struct chef_config* config)
+static int __initialize_config_defaults(struct chef_config* config)
 {
     // No default values for remote address, it needs
     // to go through the wizard.
@@ -153,18 +154,22 @@ static int __initialize_config(struct chef_config* config)
     config->cvd.address = platform_strdup("127.0.0.1");
     config->cvd.port = 51003;
 #endif
-    config->root_object = json_object();
-    return 0;
+    return config->cvd.type != NULL && config->cvd.address != NULL ? 0 : -1;
 }
 
-struct chef_config* chef_config_load(const char* confdir)
+struct chef_config* chef_config_load(void)
 {
     struct chef_config* config;
     json_error_t        error;
     char                path[PATH_MAX] = { 0 };
-    VLOG_DEBUG("config", "chef_config_load(confdir=%s)\n", confdir);
+    const char*         configDir = chef_dirs_config();
+    VLOG_DEBUG("config", "chef_config_load(confdir=%s)\n", configDir);
 
-    snprintf(&path[0], sizeof(path), "%s" CHEF_PATH_SEPARATOR_S "bake.json", confdir);
+    if (configDir == NULL) {
+        VLOG_ERROR("config", "chef_config_load: failed to get config directory\n");
+        return NULL;
+    }
+    snprintf(&path[0], sizeof(path), "%s" CHEF_PATH_SEPARATOR_S "bake.json", configDir);
 
     config = __chef_config_new(&path[0]);
     if (config == NULL) {
@@ -172,14 +177,16 @@ struct chef_config* chef_config_load(const char* confdir)
         return NULL;
     }
 
+    if (__initialize_config_defaults(config)) {
+        __chef_config_delete(config);
+        return NULL;
+    }
+
     config->root_object = json_load_file(path, 0, &error);
     if (config->root_object == NULL) {
         if (json_error_code(&error) == json_error_cannot_open_file) {
             // assume no config, write the default one
-            if (__initialize_config(config)) {
-                __chef_config_delete(config);
-                return NULL;
-            }
+            config->root_object = json_object();
             return config;
         }
         VLOG_ERROR("config", "chef_config_load: failed to load %s\n", &path[0]);
