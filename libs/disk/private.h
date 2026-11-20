@@ -29,6 +29,17 @@
 
 #define __MIN(a, b) ((a) < (b) ? (a) : (b))
 
+// fseek takes a long, which is 32 bits on Windows and cannot reach past 2GB,
+// so seek with the 64-bit variants instead
+static inline int __disk_fseek(FILE* stream, long long offset, int whence)
+{
+#ifdef _WIN32
+    return _fseeki64(stream, offset, whence);
+#else
+    return fseeko(stream, (off_t)offset, whence);
+#endif
+}
+
 struct chef_disk_partition {
     struct list_item               list_header;
     const char*                    name;
