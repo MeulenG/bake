@@ -19,7 +19,7 @@
 #include <chef/platform.h>
 #include <sys/types.h>
 
-int platform_chsize(int fd, long size)
+int platform_chsize(int fd, long long size)
 {
 	return ftruncate(fd, (off_t)size);
 }

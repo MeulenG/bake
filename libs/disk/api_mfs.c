@@ -135,7 +135,7 @@ static int __partition_read(uint64_t sector, uint8_t *buffer, uint32_t sector_co
     // make sure we get the stream position
     offset = sector * cfs->bytes_per_sector;
 
-    status = fseek(cfs->stream, (long)offset, SEEK_SET);
+    status = __disk_fseek(cfs->stream, (long long)offset, SEEK_SET);
 
     if (fread(buffer, cfs->bytes_per_sector, sector_count, cfs->stream) != sector_count) {
         return -1;
@@ -151,7 +151,7 @@ static int __partition_write(uint64_t sector, uint8_t *buffer, uint32_t sector_c
 
     // make sure we get the stream position
     offset = sector * cfs->bytes_per_sector;
-    status = fseek(cfs->stream, (long)offset, SEEK_SET);
+    status = __disk_fseek(cfs->stream, (long long)offset, SEEK_SET);
 
     // if the sector is 0, then let us modify the boot sector with the
     // MBR provided by content
