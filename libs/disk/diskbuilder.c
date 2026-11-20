@@ -430,10 +430,23 @@ static int __write_bootloader(struct chef_diskbuilder* builder)
     return 0;
 }
 
+static int __is_zero(const unsigned char* data, size_t length)
+{
+    size_t i;
+
+    for (i = 0; i < length; i++) {
+        if (data[i] != 0) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
 static int __write_partition(struct chef_disk_partition* p, unsigned int sectorSize, FILE* stream)
 {
     void*  block;
     size_t read;
+    int    hole = 0;
     VLOG_DEBUG("disk", "__write_partition(name=%s)\n", p->name);
 
     // seek to first sector
@@ -455,12 +468,33 @@ static int __write_partition(struct chef_disk_partition* p, unsigned int sectorS
             break;
         }
 
+        // The image file starts out empty, so a block of zeros does not need
+        // writing. Seeking past it leaves a hole, which reads back as zeros
+        // but takes no space on disk.
+        hole = __is_zero(block, read);
+        if (hole) {
+            if (__disk_fseek(stream, (long long)read, SEEK_CUR)) {
+                VLOG_ERROR("disk", "__write_partition: failed to skip partition data\n");
+                free(block);
+                return -1;
+            }
+            continue;
+        }
+
         written = fwrite(block, 1, read, stream);
         if (written != read) {
             VLOG_ERROR("disk", "__write_partition: failed to write partition data\n");
             free(block);
             return -1;
         }
+    }
+
+    // Seeking alone does not make the file longer, so when the partition
+    // ends in a hole, write its last byte to give the image its full size
+    if (hole && (__disk_fseek(stream, -1, SEEK_CUR) || fputc(0, stream) == EOF)) {
+        VLOG_ERROR("disk", "__write_partition: failed to write the end of the partition\n");
+        free(block);
+        return -1;
     }
 
     // do not need this anymore
